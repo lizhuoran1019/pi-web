@@ -1,4 +1,4 @@
-import { LitElement, html } from "lit";
+import { LitElement, html, nothing } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
 import { repeat } from "lit/directives/repeat.js";
 import { ChatDisclosureController } from "../chatDisclosure";
@@ -26,6 +26,8 @@ import {
 } from "../sessionNotifications";
 import type { ChatLine, ChatPart } from "./shared";
 import { chatStyles, renderSessionWarningIcon } from "./shared";
+import { buildMinimapNodes, isScrollable, type MinimapEntry, type MinimapNode } from "../chatMinimapModel";
+import "./ChatMinimap";
 import "./FormattedText";
 import "./ToolExecutionView";
 
@@ -196,6 +198,11 @@ export class ChatView extends LitElement {
   @state() private zoomedImage: { src: string; alt: string } | undefined = undefined;
   @state() private expandedMetaKey: string | undefined;
   @state() private copiedMessageKey: string | undefined;
+  @state() private minimapNodes: MinimapNode[] = [];
+  @state() private minimapScrollTop = 0;
+  @state() private minimapScrollHeight = 0;
+  @state() private minimapClientHeight = 0;
+  @state() private showMinimap = false;
   @state() private collapsedNotificationTargetKeys: ReadonlySet<string> = new Set();
   @state() private retainedEmptyNotificationTrayTargetKey: string | undefined;
   private pendingNotificationFocus: PendingNotificationFocus | undefined;
@@ -205,6 +212,10 @@ export class ChatView extends LitElement {
   private suppressLoadMoreRequests = false;
   private loadMoreCheckFrame: number | undefined;
   private scrollToBottomFrame: number | undefined;
+  private minimapFrame: number | undefined;
+  private minimapNeedsMeasure = false;
+  private coarsePointer = false;
+  private coarsePointerMedia: MediaQueryList | undefined;
   private groupedMessagesInput?: ChatLine[];
   private groupedMessagesStart = 0;
   private groupedMessagesCache: ChatGroup[] = [];
@@ -246,6 +257,7 @@ export class ChatView extends LitElement {
     window.addEventListener("resize", this.onViewportResize);
     window.addEventListener("pagehide", this.onPageHide);
     window.visualViewport?.addEventListener("resize", this.onViewportResize);
+    this.setupCoarsePointer();
   }
 
   protected override firstUpdated(): void {
@@ -259,6 +271,8 @@ export class ChatView extends LitElement {
     if (this.restoreScrollFrame !== undefined) cancelAnimationFrame(this.restoreScrollFrame);
     if (this.loadMoreCheckFrame !== undefined) cancelAnimationFrame(this.loadMoreCheckFrame);
     if (this.scrollToBottomFrame !== undefined) cancelAnimationFrame(this.scrollToBottomFrame);
+    if (this.minimapFrame !== undefined) cancelAnimationFrame(this.minimapFrame);
+    this.coarsePointerMedia?.removeEventListener("change", this.onCoarsePointerChange);
     window.removeEventListener("resize", this.onViewportResize);
     window.removeEventListener("pagehide", this.onPageHide);
     window.visualViewport?.removeEventListener("resize", this.onViewportResize);
@@ -308,6 +322,7 @@ export class ChatView extends LitElement {
     if (changed.has("hasMore") && !this.hasMore) this.loadMoreRequested = false;
     if (changed.has("sessionId")) this.restoreScrollPosition();
     if (!changed.has("sessionId") && changed.has("messages") && this.pinnedToBottom) this.scrollToBottom();
+    if (changed.has("messages") || changed.has("messageStart") || changed.has("messageTotal") || changed.has("hasMore") || changed.has("loadingMore")) this.scheduleMinimap(true);
     if (changed.has("messages") || changed.has("messageStart") || changed.has("hasMore") || changed.has("loadingMore")) this.continuePendingScrollRestore();
     if (changed.has("messages") || changed.has("hasMore") || changed.has("loadingMore")) this.requestLoadMoreIfNeeded();
     if (changed.has("notificationInbox") && this.pendingNotificationFocus !== undefined) this.focusPendingNotificationTarget();
@@ -332,7 +347,7 @@ export class ChatView extends LitElement {
     return html`
       ${this.renderTopNotices()}
       ${this.renderNotificationLiveRegions()}
-      <div class="chat-wrap">
+      <div class="chat-wrap${this.showMinimap ? " has-minimap" : ""}">
         <div class="chat" @scroll=${() => { this.onScroll(); }} @wheel=${(event: WheelEvent) => { this.onWheel(event); }} @touchstart=${(event: TouchEvent) => { this.onTouchStart(event); }} @touchmove=${(event: TouchEvent) => { this.onTouchMove(event); }}>
           ${this.renderHistoryBoundary()}
           ${repeat(
@@ -348,6 +363,7 @@ export class ChatView extends LitElement {
           ${this.renderSessionActivity()}
         </div>
         ${this.renderActivityDock()}
+        ${this.renderMinimap()}
       </div>
       ${this.renderImageZoom()}
     `;
@@ -631,6 +647,18 @@ export class ChatView extends LitElement {
     return activity.detail !== undefined && activity.detail !== "" ? `${activity.label}: ${activity.detail}` : activity.label;
   }
 
+  private renderMinimap() {
+    if (!this.showMinimap) return nothing;
+    return html`<chat-minimap
+      .nodes=${this.minimapNodes}
+      .contentScrollTop=${this.minimapScrollTop}
+      .contentScrollHeight=${this.minimapScrollHeight}
+      .viewportHeight=${this.minimapClientHeight}
+      ?hasMore=${this.hasMore}
+      .onSeek=${this.seekMinimap}
+    ></chat-minimap>`;
+  }
+
   private renderHistoryBoundary() {
     const range = this.historyRangeLabel();
     if (this.loadingMore) return html`<div class="history-boundary"><span>Loading earlier messages…</span>${range}</div>`;
@@ -826,6 +854,7 @@ export class ChatView extends LitElement {
   private onScroll() {
     this.requestLoadMoreIfNeeded();
     this.updatePinnedToBottomFromScroll();
+    this.scheduleMinimap(false);
     if (!this.suppressScrollSave) this.scheduleScrollPositionSave();
   }
 
@@ -1043,6 +1072,76 @@ export class ChatView extends LitElement {
       if (this.sessionId === scheduledSessionId) this.saveScrollPosition(scheduledSessionId);
     });
   }
+
+  private setupCoarsePointer(): void {
+    if (typeof window === "undefined" || !("matchMedia" in window)) return;
+    const media = window.matchMedia("(pointer: coarse)");
+    this.coarsePointer = media.matches;
+    media.addEventListener("change", this.onCoarsePointerChange);
+    this.coarsePointerMedia = media;
+  }
+
+  private readonly onCoarsePointerChange = (event: MediaQueryListEvent): void => {
+    this.coarsePointer = event.matches;
+    this.scheduleMinimap(false);
+  };
+
+  private scheduleMinimap(measure: boolean): void {
+    if (measure) this.minimapNeedsMeasure = true;
+    if (this.minimapFrame !== undefined) return;
+    this.minimapFrame = requestAnimationFrame(() => {
+      this.minimapFrame = undefined;
+      const needsMeasure = this.minimapNeedsMeasure;
+      this.minimapNeedsMeasure = false;
+      if (needsMeasure) this.measureMinimapNodes();
+      this.updateMinimapViewport();
+    });
+  }
+
+  private measureMinimapNodes(): void {
+    const chat = this.chat;
+    if (chat === undefined) {
+      this.minimapNodes = [];
+      return;
+    }
+    const scrollHeight = chat.scrollHeight;
+    const containerTop = chat.getBoundingClientRect().top;
+    const scrollTop = chat.scrollTop;
+    const elements = new Map<number, HTMLElement>();
+    for (const element of this.renderRoot.querySelectorAll<HTMLElement>("article.msg[data-index]")) {
+      const index = Number(element.dataset["index"]);
+      if (Number.isFinite(index)) elements.set(index, element);
+    }
+    const entries: MinimapEntry[] = [];
+    for (const group of this.groupedMessages()) {
+      if (group.kind !== "message") continue;
+      const element = elements.get(group.index);
+      if (element === undefined) continue;
+      const rect = element.getBoundingClientRect();
+      entries.push({ index: group.index, message: group.message, top: rect.top - containerTop + scrollTop, height: rect.height });
+    }
+    this.minimapNodes = buildMinimapNodes(entries, scrollHeight);
+  }
+
+  private updateMinimapViewport(): void {
+    const chat = this.chat;
+    if (chat === undefined) {
+      this.showMinimap = false;
+      return;
+    }
+    const scrollHeight = chat.scrollHeight;
+    const clientHeight = chat.clientHeight;
+    this.minimapScrollTop = chat.scrollTop;
+    this.minimapScrollHeight = scrollHeight;
+    this.minimapClientHeight = clientHeight;
+    this.showMinimap = !this.coarsePointer && isScrollable(scrollHeight, clientHeight);
+  }
+
+  private readonly seekMinimap = (scrollTop: number): void => {
+    const chat = this.chat;
+    if (chat === undefined) return;
+    chat.scrollTop = scrollTop;
+  };
 
   private scrollMarkers(): HTMLElement[] {
     return Array.from(this.renderRoot.querySelectorAll<HTMLElement>(".scroll-marker"));
