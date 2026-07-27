@@ -67,8 +67,9 @@ describe("SessionController edit from here", () => {
     await controller.editFromHere("entry-user");
 
     // The leaf is read immediately before the mutation, so the server's
-    // optimistic-concurrency check still protects this entry point.
-    expect(commandCalls).toEqual([{ sessionId: oldSession.id, text: "/tree" }]);
+    // optimistic-concurrency check still protects this entry point. The refresh
+    // that follows reads the tree again, since rewinding changed it.
+    expect(commandCalls[0]).toEqual({ sessionId: oldSession.id, text: "/tree" });
     // Pi rewinds a user target to its parent and hands back the text, so the
     // target is the message itself and no branch summary is generated.
     expect(navigationCalls).toEqual([{

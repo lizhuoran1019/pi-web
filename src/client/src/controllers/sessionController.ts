@@ -131,6 +131,7 @@ export class SessionController {
   private readonly pendingSessionStarts = new Map<string, PendingSessionStart>();
   private readonly suppressedCreatedSessions = new Map<string, SuppressedCreatedSession>();
   private readonly selectedSessionRefreshes = new TrailingRefreshCoordinator<string>();
+  private readonly sessionTreeRefreshes = new TrailingRefreshCoordinator<string>();
 
   constructor(
     private readonly getState: GetState,
@@ -1082,6 +1083,9 @@ export class SessionController {
     return this.selectedSessionRefreshes.request(key, async () => {
       if (!this.isCurrentRefreshTarget(target)) return;
       this.flushPendingUpdates();
+      // Branch structure rides alongside, never inside, this refresh: the
+      // transcript must not wait on a snapshot it does not need to render.
+      void this.refreshSessionTree(target);
       const [page, status, streamSnapshot] = await Promise.all([
         this.api.messages(target.session, { limit: MESSAGE_PAGE_SIZE }, target.machineId),
         this.api.status(target.session, target.machineId),
@@ -1111,6 +1115,30 @@ export class SessionController {
         activity: this.getState().sessionActivities[target.session.id],
       });
       this.applyStatus(status);
+    });
+  }
+
+  /**
+   * Read the branch structure behind the selected transcript, so the chat can show
+   * where a conversation forked. Purely additive: `/tree` declines while a session
+   * has work in flight and older remotes do not serve it at all, so an unreadable
+   * tree keeps the previous snapshot instead of making fork markers blink out. Any
+   * error is swallowed for the same reason — this must never surface as a session
+   * error or delay the transcript.
+   */
+  private refreshSessionTree(target: SelectedSessionRefreshTarget): Promise<void> {
+    const key = machineSessionKey(target.machineId, target.session.id);
+    return this.sessionTreeRefreshes.request(key, async () => {
+      if (!this.isCurrentRefreshTarget(target)) return;
+      let tree: SessionTreeSnapshot | undefined;
+      try {
+        const result = await this.api.runCommand(target.session, TREE_COMMAND, target.machineId);
+        tree = result.type === "tree" ? result.tree : undefined;
+      } catch {
+        return;
+      }
+      if (tree === undefined || !this.isCurrentRefreshTarget(target)) return;
+      this.setState({ sessionTree: tree });
     });
   }
 

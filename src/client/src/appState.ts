@@ -64,6 +64,8 @@ export interface AppState {
   workspaceDeletionRuns: Record<string, TerminalCommandRun>;
   commandDialog: Extract<CommandResult, { type: "select" }> | undefined;
   treeDialog: SessionTreeSnapshot | undefined;
+  /** Branch structure of the selected session, read alongside its transcript. Retained when a refresh cannot read it. */
+  sessionTree: SessionTreeSnapshot | undefined;
   modelDialog: { title: string; options: CommandOption[]; selectedValue?: string } | undefined;
   thinkingDialog: { title: string; options: CommandOption[]; selectedValue?: string } | undefined;
   themeDialog: { title: string; options: CommandOption[]; selectedValue?: string } | undefined;
@@ -112,6 +114,7 @@ export type WorkspaceScopedStateReset = Pick<AppState,
   | "startingSessionCount"
   | "selectedNotificationInbox"
   | "treeDialog"
+  | "sessionTree"
   | "fileTree"
   | "expandedDirs"
   | "selectedFilePath"
@@ -133,6 +136,7 @@ export function resetWorkspaceScopedState(): WorkspaceScopedStateReset {
     startingSessionCount: 0,
     selectedNotificationInbox: undefined,
     treeDialog: undefined,
+    sessionTree: undefined,
     fileTree: [],
     expandedDirs: {},
     selectedFilePath: undefined,
@@ -186,6 +190,7 @@ export function initialAppState(): AppState {
     workspaceDeletionRuns: {},
     commandDialog: undefined,
     treeDialog: undefined,
+    sessionTree: undefined,
     modelDialog: undefined,
     thinkingDialog: undefined,
     themeDialog: undefined,

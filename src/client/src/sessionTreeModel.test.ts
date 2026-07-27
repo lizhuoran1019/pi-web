@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SESSION_TREE_CUSTOM_INSTRUCTIONS_MAX_LENGTH, type SessionTreeNode, type SessionTreeSnapshot } from "../../shared/apiTypes";
-import { buildSessionTreeModel, initialSessionTreeSelection, toggleSessionTreeFold, transitionSessionTreeKey, validateSessionTreeSummaryChoice, visibleSessionTreeRows } from "./sessionTreeModel";
+import { buildSessionTreeModel, initialSessionTreeSelection, sessionTreeBranchPositions, toggleSessionTreeFold, transitionSessionTreeKey, validateSessionTreeSummaryChoice, visibleSessionTreeRows } from "./sessionTreeModel";
 
 describe("session tree hierarchy model", () => {
   it("builds a complete forest while normalizing orphans, cycles, self-links, and duplicate IDs", () => {
@@ -184,6 +184,108 @@ describe("session tree summary validation", () => {
   });
 });
 
+describe("sessionTreeBranchPositions", () => {
+  it("counts the branches at a fork and points at each neighbour's newest reply", () => {
+    // root
+    //  +- ask-1 -> reply-1
+    //  +- ask-2 -> reply-2 -> ask-3 -> reply-3   (shown)
+    //  +- ask-4 -> reply-4
+    const positions = sessionTreeBranchPositions(buildSessionTreeModel({
+      nodes: [
+        node("root", null),
+        userNode("ask-1", "root"),
+        node("reply-1", "ask-1"),
+        userNode("ask-2", "root"),
+        node("reply-2", "ask-2"),
+        userNode("ask-3", "reply-2"),
+        node("reply-3", "ask-3"),
+        userNode("ask-4", "root"),
+        node("reply-4", "ask-4"),
+      ],
+      activeLeafId: "reply-3",
+      activePathIds: ["root", "ask-2", "reply-2", "ask-3", "reply-3"],
+    }));
+
+    // The targets are replies, never the sibling asks: pi reads a user target as
+    // "re-edit this" and would move the leaf to that target's parent instead.
+    expect(positions.get("ask-2")).toEqual({ index: 2, total: 3, olderTargetId: "reply-1", newerTargetId: "reply-4" });
+    // A fork deeper inside the shown branch is its own switcher, and the only
+    // entries with siblings get one at all.
+    expect(positions.get("ask-3")).toBeUndefined();
+    expect(positions.get("root")).toBeUndefined();
+  });
+
+  it("treats parentless entries as each other's alternatives", () => {
+    // Re-editing the very first message resets the leaf, so the new branch starts
+    // at a second root rather than as a child.
+    const positions = sessionTreeBranchPositions(buildSessionTreeModel({
+      nodes: [
+        userNode("ask-1", null),
+        node("reply-1", "ask-1"),
+        userNode("ask-2", null),
+        node("reply-2", "ask-2"),
+      ],
+      activeLeafId: "reply-1",
+      activePathIds: ["ask-1", "reply-1"],
+    }));
+
+    expect(positions.get("ask-1")).toEqual({ index: 1, total: 2, olderTargetId: undefined, newerTargetId: "reply-2" });
+  });
+
+  it("offers no target for a branch that has nothing to switch to yet", () => {
+    // `ask-2` was sent but produced no entry, so there is nothing pi can switch
+    // to: navigating to `ask-2` itself would rewind rather than show the branch.
+    const positions = sessionTreeBranchPositions(buildSessionTreeModel({
+      nodes: [
+        node("root", null),
+        userNode("ask-1", "root"),
+        node("reply-1", "ask-1"),
+        userNode("ask-2", "root"),
+      ],
+      activeLeafId: "reply-1",
+      activePathIds: ["root", "ask-1", "reply-1"],
+    }));
+
+    expect(positions.get("ask-1")).toEqual({ index: 1, total: 2, olderTargetId: undefined, newerTargetId: undefined });
+  });
+
+  it("falls back to an earlier fork when the newest one holds nothing switchable", () => {
+    // Inside the alternative branch, the newest fork (`ask-3`) is unanswered, so
+    // the switch target has to come from the older fork's reply.
+    const positions = sessionTreeBranchPositions(buildSessionTreeModel({
+      nodes: [
+        node("root", null),
+        userNode("ask-1", "root"),
+        node("reply-1", "ask-1"),
+        userNode("ask-2", "root"),
+        node("reply-2", "ask-2"),
+        userNode("ask-3", "ask-2"),
+      ],
+      activeLeafId: "reply-1",
+      activePathIds: ["root", "ask-1", "reply-1"],
+    }));
+
+    expect(positions.get("ask-1")?.newerTargetId).toBe("reply-2");
+  });
+
+  it("skips a custom message when choosing a target", () => {
+    const positions = sessionTreeBranchPositions(buildSessionTreeModel({
+      nodes: [
+        node("root", null),
+        userNode("ask-1", "root"),
+        node("reply-1", "ask-1"),
+        userNode("ask-2", "root"),
+        node("reply-2", "ask-2"),
+        { id: "note", parentId: "reply-2", kind: "custom-message", summary: "note" },
+      ],
+      activeLeafId: "reply-1",
+      activePathIds: ["root", "ask-1", "reply-1"],
+    }));
+
+    expect(positions.get("ask-1")?.newerTargetId).toBe("reply-2");
+  });
+});
+
 function snapshot(): SessionTreeSnapshot {
   return {
     nodes: [
@@ -199,4 +301,8 @@ function snapshot(): SessionTreeSnapshot {
 
 function node(id: string, parentId: string | null): SessionTreeNode {
   return { id, parentId, kind: "assistant", summary: id };
+}
+
+function userNode(id: string, parentId: string | null): SessionTreeNode {
+  return { id, parentId, kind: "user", summary: id };
 }
