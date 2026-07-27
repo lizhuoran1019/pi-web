@@ -137,6 +137,28 @@ export function chatQueuedSectionShowsClearAction(section: QueuedMessageSection,
   return section.source === "server" && canClearServerQueue && hasClearHandler;
 }
 
+/** The "edit from here" affordance for one transcript line. */
+export interface ChatEditFromHereAction {
+  /** Session entry to rewind to. */
+  entryId: string;
+  /** Why the action is currently refused, or `undefined` when it can run. */
+  disabledReason: string | undefined;
+}
+
+/**
+ * The "edit from here" action for a transcript line, or `undefined` when the line
+ * offers none. Only a user message can be rewound to — pi resolves the new leaf
+ * from the target entry's parent and hands that message's text back for editing —
+ * and only a line that uniquely identifies its session entry can be addressed at
+ * all, which is what excludes lines normalization split out of one entry. The
+ * server refuses tree navigation while a session has work in flight, so a live
+ * session yields a disabled action rather than a request that is bound to fail.
+ */
+export function chatEditFromHereAction(message: ChatLine, sessionLive: boolean): ChatEditFromHereAction | undefined {
+  if (message.role !== "user" || message.entryId === undefined) return undefined;
+  return { entryId: message.entryId, disabledReason: sessionLive ? "stop current activity first" : undefined };
+}
+
 /** A rendered session-warning row derived from live status warnings. */
 export interface ChatSessionWarningRow {
   severity: SessionWarningSeverity;
@@ -213,12 +235,15 @@ export class ChatView extends LitElement {
   @property({ type: Boolean }) warningsVisible = true;
   @property({ attribute: false }) onToggleWarnings?: () => void;
   @property({ attribute: false }) onLoadMore?: () => void;
+  /** Rewind the session to just before `entryId` and refill the prompt editor. Absent when the session cannot be written to. */
+  @property({ attribute: false }) onEditFromHere?: (entryId: string) => Promise<void>;
   @query(".chat") private chat?: HTMLDivElement;
   @query("dialog.image-zoom") private imageZoomDialog?: HTMLDialogElement;
   @state() private pinnedToBottom = true;
   @state() private zoomedImage: { src: string; alt: string } | undefined = undefined;
   @state() private expandedMetaKey: string | undefined;
   @state() private copiedMessageKey: string | undefined;
+  @state() private editingFromEntryId: string | undefined;
   @state() private currentConversationIndex: number | undefined;
   @state() private collapsedNotificationTargetKeys: ReadonlySet<string> = new Set();
   @state() private retainedEmptyNotificationTrayTargetKey: string | undefined;
@@ -876,15 +901,51 @@ export class ChatView extends LitElement {
   }
 
   private renderMessageActions(message: ChatLine, key: string) {
-    if (!this.isCopyableMessage(message)) return null;
+    const copyable = this.isCopyableMessage(message);
+    const editFromHere = this.onEditFromHere === undefined ? undefined : chatEditFromHereAction(message, this.isSessionLive());
+    if (!copyable && editFromHere === undefined) return null;
     const copied = this.copiedMessageKey === key;
     return html`
       <div class="msg-actions" aria-label="Message actions">
-        <button type="button" class="msg-action" title=${copied ? "Copied" : "Copy message"} aria-label=${`${copied ? "Copied" : "Copy"} ${message.role} message`} @click=${(event: MouseEvent) => { void this.copyMessage(message, key, event); }}>
-          <span aria-hidden="true">${copied ? "✓" : "⧉"}</span>
-        </button>
+        ${!copyable ? null : html`
+          <button type="button" class="msg-action" title=${copied ? "Copied" : "Copy message"} aria-label=${`${copied ? "Copied" : "Copy"} ${message.role} message`} @click=${(event: MouseEvent) => { void this.copyMessage(message, key, event); }}>
+            <span aria-hidden="true">${copied ? "✓" : "⧉"}</span>
+          </button>
+        `}
+        ${editFromHere === undefined ? null : this.renderEditFromHereAction(editFromHere)}
       </div>
     `;
+  }
+
+  private renderEditFromHereAction(action: ChatEditFromHereAction) {
+    // One rewind at a time: a second navigation would carry the leaf the first one
+    // just invalidated, and the user would get a stale-session error instead of an
+    // explanation.
+    const disabledReason = this.editingFromEntryId === undefined ? action.disabledReason : "already rewinding";
+    return html`
+      <button
+        type="button"
+        class="msg-action"
+        ?disabled=${disabledReason !== undefined}
+        title=${disabledReason === undefined ? "Edit from here" : `Edit from here — ${disabledReason}`}
+        aria-label="Edit from here — rewind this session to before this message"
+        @click=${(event: MouseEvent) => { void this.editFromHere(action.entryId, event); }}
+      >
+        <span aria-hidden="true">↩</span>
+      </button>
+    `;
+  }
+
+  private async editFromHere(entryId: string, event: MouseEvent): Promise<void> {
+    event.stopPropagation();
+    const editFromHere = this.onEditFromHere;
+    if (editFromHere === undefined || this.editingFromEntryId !== undefined) return;
+    this.editingFromEntryId = entryId;
+    try {
+      await editFromHere(entryId);
+    } finally {
+      this.editingFromEntryId = undefined;
+    }
   }
 
   private onMetaKeydown(event: KeyboardEvent, key: string, expanded: boolean) {

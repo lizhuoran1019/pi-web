@@ -1,7 +1,8 @@
-import { api as defaultApi, type AskUserCloseResponse, type AskUserSubmission, type CommandResult, type ExtensionDialogAnswer, type ExtensionDialogCloseReason, type ExtensionDialogCloseResponse, type ExtensionDialogOutcome, type PendingAskUser, type PendingExtensionDialog, type PromptAttachment, type QueuedSessionMessage, type SessionActivity, type SessionBulkFailure, type SessionCleanupExecuteResponse, type SessionInfo, type SessionRef, type SessionStatus, type SessionStreamSnapshot, type SessionTreeNavigateResult, type SessionTreeSummaryChoice, type Workspace } from "../api";
+import { api as defaultApi, type AskUserCloseResponse, type AskUserSubmission, type CommandResult, type ExtensionDialogAnswer, type ExtensionDialogCloseReason, type ExtensionDialogCloseResponse, type ExtensionDialogOutcome, type PendingAskUser, type PendingExtensionDialog, type PromptAttachment, type QueuedSessionMessage, type SessionActivity, type SessionBulkFailure, type SessionCleanupExecuteResponse, type SessionInfo, type SessionRef, type SessionStatus, type SessionStreamSnapshot, type SessionTreeNavigateRequest, type SessionTreeNavigateResult, type SessionTreeSnapshot, type SessionTreeSummaryChoice, type Workspace } from "../api";
 import type { AppState, ClosedExtensionDialog } from "../appState";
 import { forgetCachedNewSession, isCachedNewSessionInfo, markCachedNewSessionInfo, mergeCachedNewSessions, rememberCachedNewSession, stripCachedNewSessionMarker } from "../cachedNewSessions";
 import { textMessage } from "../chatMessages";
+import type { ChatLine } from "../components/shared";
 import { machineSessionKey } from "../machineKeys";
 import { clearDraft, moveDraft, saveDraft } from "../promptDraftStorage";
 import { clearAskDraft } from "../askDrafts";
@@ -19,6 +20,8 @@ import { sessionPathsEqual } from "../sessionPaths";
 import { TrailingRefreshCoordinator } from "./trailingRefreshCoordinator";
 
 const MESSAGE_PAGE_SIZE = 100;
+/** Slash command that returns the session-tree snapshot, including the current leaf. */
+const TREE_COMMAND = "/tree";
 const BULK_FALLBACK_CONCURRENCY = 4;
 
 export interface SessionEventSocket {
@@ -473,12 +476,68 @@ export class SessionController {
       throw new Error("The session tree navigator is no longer available");
     }
 
+    return this.runTreeNavigation(session, { targetId, expectedLeafId: tree.activeLeafId, summary }, tree);
+  }
+
+  /**
+   * Rewind the session to just before a user message so the next send starts a
+   * new branch there. Pi resolves the new leaf from the target entry's parent and
+   * hands back that message's text for re-editing; the abandoned branch stays in
+   * the session file. The leaf is read immediately before the mutation so the
+   * server's optimistic-concurrency check still guards this entry point.
+   */
+  async editFromHere(entryId: string): Promise<void> {
+    const state = this.getState();
+    const session = state.selectedSession;
+    if (session === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) return;
     const machineId = selectedMachineId(state);
+    const selectionSeq = this.selectionSeq;
+
+    let tree: SessionTreeSnapshot;
+    try {
+      const result = await this.api.runCommand(session, TREE_COMMAND, machineId);
+      if (result.type !== "tree") {
+        if (this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) this.setState({ error: treeUnavailableMessage(result) });
+        return;
+      }
+      tree = result.tree;
+    } catch (error) {
+      if (this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) this.setState({ error: String(error) });
+      return;
+    }
+
+    if (!this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) return;
+    if (!tree.nodes.some((node) => node.id === entryId)) {
+      this.setState({ error: "That message is no longer part of this session's history." });
+      return;
+    }
+
+    try {
+      await this.runTreeNavigation(session, { targetId: entryId, expectedLeafId: tree.activeLeafId, summary: { mode: "none" } }, undefined);
+    } catch {
+      // runTreeNavigation already surfaced the failure in `state.error`.
+      return;
+    }
+  }
+
+  /**
+   * Shared tail of every tree navigation: run the mutation, then hand pi's editor
+   * text to the prompt editor and re-read the branch authoritatively. Both the
+   * `/tree` dialog and the inline transcript entry go through here so the two
+   * cannot drift apart. `openTree` is the snapshot to close afterwards, when the
+   * navigation came from the dialog.
+   */
+  private async runTreeNavigation(
+    session: SessionInfo,
+    request: SessionTreeNavigateRequest,
+    openTree: SessionTreeSnapshot | undefined,
+  ): Promise<SessionTreeNavigateResult> {
+    const machineId = selectedMachineId(this.getState());
     const selectionSeq = this.selectionSeq;
     const cacheKey = machineSessionKey(machineId, session.id);
     let result: SessionTreeNavigateResult;
     try {
-      result = await this.api.navigateTree(session, { targetId, expectedLeafId: tree.activeLeafId, summary }, machineId);
+      result = await this.api.navigateTree(session, request, machineId);
     } catch (error) {
       if (this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) this.setState({ error: String(error) });
       throw error;
@@ -513,7 +572,7 @@ export class SessionController {
       if (this.isSelectedSessionIdentity(session.id, machineId)) this.setState({ error: String(authoritativeRefreshFailure.error) });
       throw authoritativeRefreshFailure.error;
     }
-    if (this.isSelectedSessionIdentity(session.id, machineId) && this.getState().treeDialog === tree) this.setState({ treeDialog: undefined });
+    if (openTree !== undefined && this.isSelectedSessionIdentity(session.id, machineId) && this.getState().treeDialog === openTree) this.setState({ treeDialog: undefined });
     return result;
   }
 
@@ -908,20 +967,20 @@ export class SessionController {
 
   /** Send the value the user gave for one of the session's open extension dialogs. */
   answerDialog(dialogId: string, value: ExtensionDialogAnswer): Promise<void> {
-    return this.closeOpenDialog(dialogId, (session, machineId) => this.api.answerDialog(session, dialogId, value, machineId));
+    return this.closeOpenDialog((session, machineId) => this.api.answerDialog(session, dialogId, value, machineId));
   }
 
   /** Close one of the session's open extension dialogs without answering it. */
   cancelDialog(dialogId: string): Promise<void> {
-    return this.closeOpenDialog(dialogId, (session, machineId) => this.api.cancelDialog(session, dialogId, machineId));
+    return this.closeOpenDialog((session, machineId) => this.api.cancelDialog(session, dialogId, machineId));
   }
 
-  private async closeOpenDialog(dialogId: string, close: (session: SessionInfo, machineId: string) => Promise<ExtensionDialogCloseResponse>): Promise<void> {
+  private async closeOpenDialog(close: (session: SessionInfo, machineId: string) => Promise<ExtensionDialogCloseResponse>): Promise<void> {
     const state = this.getState();
     const session = state.selectedSession;
     if (session === undefined || session.archived === true) return;
     if (isClientPendingStartSessionInfo(session)) {
-      await this.closePendingStartDialog(session, dialogId, close);
+      await this.closePendingStartDialog(session, close);
       return;
     }
     const machineId = selectedMachineId(state);
@@ -951,7 +1010,7 @@ export class SessionController {
    * backend session the startup events named, so the close goes out under the
    * real id — the only route the daemon can serve before readiness.
    */
-  private async closePendingStartDialog(session: ClientPendingStartSessionInfo, dialogId: string, close: (session: SessionInfo, machineId: string) => Promise<ExtensionDialogCloseResponse>): Promise<void> {
+  private async closePendingStartDialog(session: ClientPendingStartSessionInfo, close: (session: SessionInfo, machineId: string) => Promise<ExtensionDialogCloseResponse>): Promise<void> {
     const pending = this.pendingSessionStarts.get(session.id);
     const backendSessionId = pending?.backendSessionId;
     // Without the real id there is no route to answer through — and no way a
@@ -1513,6 +1572,19 @@ export class SessionController {
     } else if (event.type === "session.name") {
       this.applySessionName(event.sessionId, event.name);
     }
+    if (event.type === "agent.end") this.refreshTranscriptIdentity();
+  }
+
+  /**
+   * Live events carry no entry ids: pi announces a message before it appends the
+   * entry, so the id does not exist yet. A message sent in this view therefore
+   * cannot be addressed by entry id until the branch is re-read from the server.
+   * Do that when a turn settles, and only while something is actually missing an
+   * id, so reading an idle session costs no extra requests.
+   */
+  private refreshTranscriptIdentity(): void {
+    if (!hasUnidentifiedUserMessage(this.getState().messages)) return;
+    void this.refreshSelectedSession();
   }
 
   private queueTranscriptEvent(event: SessionUiEvent): void {
@@ -1910,6 +1982,17 @@ function sessionMessageCountPatch(state: AppState, sessionId: string, messageCou
 
 function isHighFrequencyTranscriptEvent(event: SessionUiEvent): boolean {
   return event.type === "assistant.delta" || event.type === "assistant.thinking.delta" || event.type === "shell.chunk";
+}
+
+/** Whether the transcript holds a user line that no entry id can address yet. */
+function hasUnidentifiedUserMessage(messages: readonly ChatLine[]): boolean {
+  return messages.some((message) => message.role === "user" && message.entryId === undefined);
+}
+
+/** Reuse the server's wording when it declines to open the session tree. */
+function treeUnavailableMessage(result: CommandResult): string {
+  if (result.type === "unsupported" && result.message !== "") return result.message;
+  return "The session tree is unavailable for this session.";
 }
 
 function isSessionNotFoundError(error: unknown): boolean {

@@ -967,7 +967,7 @@ export class PiWebApp extends LitElement {
     if (!this.unreadConnected) return;
     const machineIds = new Set(this.state.machines.map((machine) => machine.id));
     machineIds.add(selectedMachineId(this.state));
-    await Promise.all([...machineIds].map(async (machineId) => { await this.renegotiateUnreadMachine(machineId); }));
+    await Promise.all([...machineIds].map((machineId) => this.renegotiateUnreadMachine(machineId)));
   }
 
   private renegotiateUnreadMachine(machineId: string): Promise<void> {
@@ -1383,7 +1383,7 @@ export class PiWebApp extends LitElement {
         .onDeleteArchivedSessions=${(sessions: SessionInfo[]) => this.sessions.deleteArchivedSessions(sessions)}
         .onDetachParentSession=${(session: SessionInfo) => this.sessions.detachParent(session)}
         .parentSessionLocation=${this.parentSessionLocationFor}
-        .onGoToParentSession=${(session: SessionInfo, location: ParentSessionLocation) => this.goToParentSession(location)}
+        .onGoToParentSession=${(_session: SessionInfo, location: ParentSessionLocation) => this.goToParentSession(location)}
         .onReloadSession=${(session: SessionInfo) => this.sessions.reloadSession(session)}
         .onCleanupSessions=${() => { this.openSessionCleanupDialog(); }}
         .onFocusNavigationTarget=${(target: NavigationFocusTarget) => { void this.focusNavigationTarget(target); }}
@@ -1976,7 +1976,9 @@ export class PiWebApp extends LitElement {
   private openSelectedMachine(): void {
     const machine = this.state.selectedMachine;
     if (machine?.kind !== "remote" || machine.baseUrl === undefined) return;
-    window.open(machine.baseUrl, "_blank", "noopener,noreferrer");
+    const url = new URL(machine.baseUrl, window.location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return;
+    window.open(url.href, "_blank", "noopener,noreferrer");
   }
 
   private runAction(action: AppAction): void {
@@ -2178,9 +2180,11 @@ export class PiWebApp extends LitElement {
     void this.openThinkingDialog();
   };
 
+  private readonly handleEditFromHere = (entryId: string): Promise<void> => this.sessions.editFromHere(entryId);
+
   private renderChatView(state: AppState, session: SessionInfo) {
     return html`
-      <chat-view .sessionId=${session.id} .messages=${state.messages} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? []} .status=${state.status} .activity=${state.activity} .pendingAsk=${state.pendingAsk} .pendingDialogs=${state.pendingDialogs} .closedDialogs=${state.closedDialogs} .onAnswerDialog=${this.handleAnswerDialog} .onCancelDialog=${this.handleCancelDialog} .onDismissClosedDialog=${this.handleDismissClosedDialog} .askDraftSessionId=${machineSessionKey(selectedMachineId(state), session.id)} .onSubmitAsk=${this.handleSubmitAsk} .notificationInbox=${selectedNotificationView(state.selectedNotificationInbox)} .canClearServerQueue=${this.canClearServerQueue()} .onClearServerQueue=${this.handleClearServerQueue} .onDismissWarning=${this.handleDismissWarning} .onDismissNotification=${this.handleDismissNotification} .onDismissAllNotifications=${this.handleDismissAllNotifications} .warningsVisible=${!this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings} .onLoadMore=${() => this.withChatPrependTransition(() => this.sessions.loadEarlierMessages())}></chat-view>
+      <chat-view .sessionId=${session.id} .messages=${state.messages} .messageStart=${state.messagePageStart} .messageEnd=${state.messagePageEnd} .messageTotal=${state.messagePageTotal} .hasMore=${state.messagePageStart > 0} .loadingMore=${state.isLoadingEarlierMessages} .isSendingPrompt=${state.sendingPrompts[session.id] === true} .isCompacting=${state.status?.isCompacting === true} .pendingMessageCount=${state.status?.pendingMessageCount ?? 0} .clientQueuedMessages=${state.clientQueuedSessionMessages[session.id] ?? []} .status=${state.status} .activity=${state.activity} .pendingAsk=${state.pendingAsk} .pendingDialogs=${state.pendingDialogs} .closedDialogs=${state.closedDialogs} .onAnswerDialog=${this.handleAnswerDialog} .onCancelDialog=${this.handleCancelDialog} .onDismissClosedDialog=${this.handleDismissClosedDialog} .askDraftSessionId=${machineSessionKey(selectedMachineId(state), session.id)} .onSubmitAsk=${this.handleSubmitAsk} .notificationInbox=${selectedNotificationView(state.selectedNotificationInbox)} .canClearServerQueue=${this.canClearServerQueue()} .onClearServerQueue=${this.handleClearServerQueue} .onDismissWarning=${this.handleDismissWarning} .onDismissNotification=${this.handleDismissNotification} .onDismissAllNotifications=${this.handleDismissAllNotifications} .warningsVisible=${!this.sessionWarningVisibility.collapsed} .onToggleWarnings=${this.handleToggleWarnings} .onLoadMore=${() => this.withChatPrependTransition(() => this.sessions.loadEarlierMessages())} .onEditFromHere=${session.archived === true ? undefined : this.handleEditFromHere}></chat-view>
     `;
   }
 

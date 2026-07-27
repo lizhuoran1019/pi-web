@@ -9,6 +9,7 @@ import {
 import type { ChatLine } from "./shared";
 import {
   ChatView,
+  chatEditFromHereAction,
   chatEventAnchorKey,
   chatGroupAnchorKey,
   chatGroupScrollMarkerId,
@@ -330,6 +331,73 @@ describe("ChatView event-group disclosure wiring", () => {
   });
 });
 
+describe("chatEditFromHereAction", () => {
+  const userLine = (entryId?: string): ChatLine => ({
+    role: "user",
+    parts: [{ type: "text", text: "first ask" }],
+    ...(entryId === undefined ? {} : { entryId }),
+  });
+
+  it("offers the action on a user line that identifies its session entry", () => {
+    expect(chatEditFromHereAction(userLine("entry-1"), false)).toEqual({ entryId: "entry-1", disabledReason: undefined });
+  });
+
+  it("disables the action while the session has work in flight", () => {
+    expect(chatEditFromHereAction(userLine("entry-1"), true)).toEqual({ entryId: "entry-1", disabledReason: "stop current activity first" });
+  });
+
+  it("offers nothing when the line cannot be addressed by entry id", () => {
+    // A line normalization split out of one entry carries no id, so there is no
+    // unambiguous rewind target.
+    expect(chatEditFromHereAction(userLine(), false)).toBeUndefined();
+  });
+
+  it("offers nothing for lines that are not user messages", () => {
+    expect(chatEditFromHereAction({ role: "assistant", parts: [{ type: "text", text: "answer" }], entryId: "entry-2" }, false)).toBeUndefined();
+  });
+});
+
+describe("ChatView edit-from-here wiring", () => {
+  // Escape hatch: these cases verify the rewind button's Lit event wiring, whose
+  // only observable effects are the injected callback and the one-at-a-time
+  // guard. Vitest runs with no DOM environment here, so handler extraction
+  // anchored to the button's stable aria-label is proportionate.
+  const marker = 'aria-label="Edit from here';
+  const userLine: ChatLine = { role: "user", parts: [{ type: "text", text: "first ask" }], entryId: "entry-1" };
+
+  it("rewinds to the entry the activated line came from", () => {
+    const view = new ChatView();
+    const onEditFromHere = vi.fn<(entryId: string) => Promise<void>>(() => Promise.resolve());
+    view.onEditFromHere = onEditFromHere;
+
+    templateEventHandlerNearMarker(requireTemplate(renderMessageActions(view, userLine, "m:0")), marker)(new Event("click"));
+
+    expect(onEditFromHere).toHaveBeenCalledExactlyOnceWith("entry-1");
+  });
+
+  it("runs one rewind at a time", () => {
+    const view = new ChatView();
+    let settle = (): void => undefined;
+    const onEditFromHere = vi.fn<(entryId: string) => Promise<void>>(() => new Promise<void>((resolve) => { settle = resolve; }));
+    view.onEditFromHere = onEditFromHere;
+
+    const activate = templateEventHandlerNearMarker(requireTemplate(renderMessageActions(view, userLine, "m:0")), marker);
+    activate(new Event("click"));
+    activate(new Event("click"));
+
+    // A second navigation would carry the leaf the first one is invalidating, so
+    // the user would get a stale-session error instead of a rewind.
+    expect(onEditFromHere).toHaveBeenCalledOnce();
+    settle();
+  });
+
+  it("omits the action entirely when no rewind handler is wired", () => {
+    const view = new ChatView();
+
+    expect(() => templateEventHandlerNearMarker(requireTemplate(renderMessageActions(view, userLine, "m:0")), marker)).toThrow();
+  });
+});
+
 interface GroupBodyRenderCall {
   messages: ChatLine[];
   startIndex: number;
@@ -339,6 +407,7 @@ type RenderQueuedMessages = (this: ChatView) => TemplateResult;
 type RenderMessageGroup = (this: ChatView, messages: ChatLine[], startIndex: number, endIndex: number, defaultOpen: boolean) => TemplateResult;
 type RenderMessageGroupBody = (this: ChatView, messages: ChatLine[], startIndex: number) => TemplateResult;
 type RenderWarnings = (this: ChatView) => TemplateResult | null;
+type RenderMessageActions = (this: ChatView, message: ChatLine, key: string) => TemplateResult | null;
 type RenderNotificationTray = (this: ChatView) => TemplateResult | null;
 type FocusPendingNotificationTarget = (this: ChatView) => void;
 type TemplateEventHandler = (event: Event) => void;
@@ -353,6 +422,17 @@ function renderMessageGroup(view: ChatView, messages: ChatLine[], startIndex: nu
   const method: unknown = Reflect.get(view, "renderMessageGroup");
   if (!isRenderMessageGroup(method)) throw new Error("ChatView.renderMessageGroup is not callable");
   return method.call(view, messages, startIndex, endIndex, defaultOpen);
+}
+
+function renderMessageActions(view: ChatView, message: ChatLine, key: string): TemplateResult | null {
+  const method: unknown = Reflect.get(view, "renderMessageActions");
+  if (!isRenderMessageActions(method)) throw new Error("ChatView.renderMessageActions is not callable");
+  return method.call(view, message, key);
+}
+
+function requireTemplate(value: TemplateResult | null): TemplateResult {
+  if (value === null) throw new Error("Expected a rendered template");
+  return value;
 }
 
 function renderWarnings(view: ChatView): TemplateResult | null {
@@ -394,6 +474,10 @@ function isRenderMessageGroup(value: unknown): value is RenderMessageGroup {
 }
 
 function isRenderMessageGroupBody(value: unknown): value is RenderMessageGroupBody {
+  return typeof value === "function";
+}
+
+function isRenderMessageActions(value: unknown): value is RenderMessageActions {
   return typeof value === "function";
 }
 
