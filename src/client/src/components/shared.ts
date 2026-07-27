@@ -439,12 +439,17 @@ export const chatStyles = css`
   .msg-action { display: inline-grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--pi-border); border-radius: 6px; background: var(--pi-surface); color: var(--pi-muted); padding: 0; font: 14px system-ui, sans-serif; line-height: 1; cursor: pointer; }
   .msg-action:hover:not(:disabled), .msg-action:focus:not(:disabled) { color: var(--pi-text); border-color: var(--pi-accent); }
   .msg-action:disabled { opacity: .5; cursor: not-allowed; }
-  .branch-switcher { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 1px; }
-  .branch-arrow { display: inline-grid; place-items: center; width: 20px; height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--pi-muted); font: 14px system-ui, sans-serif; line-height: 1; cursor: pointer; }
+  /* Recedes with the timestamp it sits next to: at rest both are background
+     information about the message, not something to act on. */
+  .branch-switcher { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 1px; opacity: .28; transition: opacity .12s ease; }
+  .msg:hover > .msg-header .branch-switcher, .msg:focus-within > .msg-header .branch-switcher, .group-msg:hover > .msg-header .branch-switcher, .group-msg:focus-within > .msg-header .branch-switcher { opacity: 1; }
+  .branch-arrow { display: inline-grid; place-items: center; width: 20px; height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--pi-dim); font: 14px system-ui, sans-serif; line-height: 1; cursor: pointer; }
   .branch-arrow:hover:not(:disabled), .branch-arrow:focus:not(:disabled) { color: var(--pi-text); background: var(--pi-surface); }
-  .branch-arrow:disabled { opacity: .4; cursor: default; }
+  /* Colour, not opacity: the group is already faded at rest and compounding the
+     two would leave a disabled arrow invisible. */
+  .branch-arrow:disabled { color: var(--pi-border); cursor: default; }
   /* Tabular digits keep the row from twitching as the count changes. */
-  .branch-count { color: var(--pi-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .branch-count { color: var(--pi-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
   .msg:hover > .msg-header .msg-actions, .msg:focus-within > .msg-header .msg-actions, .group-msg:hover > .msg-header .msg-actions, .group-msg:focus-within > .msg-header .msg-actions { opacity: 1; }
   .label { display: block; color: var(--pi-muted); font-size: 12px; text-transform: uppercase; }
   .msg-header .label { margin: 0; }
@@ -454,6 +459,7 @@ export const chatStyles = css`
   .msg-meta:focus { outline: 1px solid var(--pi-border); outline-offset: 3px; border-radius: 4px; }
   @media (hover: none) {
     .msg-actions { opacity: 1; }
+    .branch-switcher { opacity: 1; }
     .msg-meta { opacity: .75; max-width: 26px; }
     .msg-meta:not(.expanded) { display: inline-grid; width: 26px; height: 22px; place-items: center; font-size: 0; text-overflow: clip; }
     .msg-meta::before { content: "ⓘ"; font-size: 13px; }

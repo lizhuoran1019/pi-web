@@ -856,8 +856,14 @@ export class ChatView extends LitElement {
       <div class="msg-header">
         <b class="label">${label}</b>
         <div class="msg-header-trailing">
-          ${this.renderBranchSwitcher(message)}
+          <!-- Actions first: they are hidden with opacity, which still reserves
+               their width, so keeping them at the start of this right-aligned row
+               spends that width on empty header space instead of opening a gap
+               between the branch counter and the timestamp. Hiding them outright
+               would take them out of the tab order and put copy and rewind out of
+               reach of the keyboard. -->
           ${this.renderMessageActions(message, key)}
+          ${this.renderBranchSwitcher(message)}
           <span class=${expanded ? "msg-meta expanded" : "msg-meta"} role="button" tabindex="0" title=${meta} aria-label=${meta} aria-expanded=${String(expanded)} @click=${() => { this.expandedMetaKey = expanded ? undefined : key; }} @keydown=${(event: KeyboardEvent) => { this.onMetaKeydown(event, key, expanded); }}>${meta}</span>
         </div>
       </div>
