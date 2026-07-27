@@ -45,10 +45,14 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionRou
     }
   });
 
-  app.post<{ Body: { cwd?: unknown } | undefined }>(`${prefix}/sessions`, async (request, reply) => {
+  app.post<{ Body: { cwd?: unknown; startupToken?: unknown } | undefined }>(`${prefix}/sessions`, async (request, reply) => {
     try {
       const body = requireRecord(request.body);
-      return await sessions.start(normalizeRequestCwd(requireString(body, "cwd")));
+      // An opaque label the caller uses to recognise its own construction's
+      // startup reports. Optional: only a browser row waiting for a session id
+      // has anything to correlate.
+      const startupToken = body["startupToken"] === undefined ? undefined : requireNonEmptyString(body, "startupToken");
+      return await sessions.start(normalizeRequestCwd(requireString(body, "cwd")), optionalField("startupToken", startupToken));
     } catch (error) {
       return reply.code(400).send({ error: errorMessage(error) });
     }

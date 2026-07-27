@@ -426,11 +426,39 @@ export interface SessionActivity {
   label: string;
   detail?: string;
   at: string;
+  /**
+   * Set only on the startup window's own reports. A startup phase is genuinely
+   * in progress, so it is published as `active` and rendered like any other
+   * activity, but *starting* a session is not *working* in it: there is nothing
+   * to stop, nothing that blocks reloading from disk, and no workspace-level
+   * work to report. `isSessionActive()` reads this to keep the two apart.
+   */
+  startup?: boolean;
 }
 
 export interface QueuedSessionMessage {
   kind: "steer" | "followUp";
   text: string;
+}
+
+/**
+ * Progress of the session startup window, where the daemon is still
+ * constructing the agent session and no `PiAgentSession` exists yet, so
+ * `activity.update` cannot be published for it.
+ *
+ * `startupToken` is the opaque label a create request supplied, echoed back so a
+ * browser row still waiting for a session id recognises its own construction.
+ * The daemon never interprets it and it never becomes the session id:
+ * `activity.sessionId` always carries the real id, which is how an *open* of a
+ * session the browser already knows is routed instead.
+ *
+ * `activity.phase === "idle"` means the startup window ended with nothing left
+ * to report, so a browser that substituted its own text should restore it.
+ */
+export interface SessionStartupProgressEvent {
+  type: "session.startup";
+  startupToken?: string;
+  activity: SessionActivity;
 }
 
 /**
@@ -977,5 +1005,6 @@ type SessionUiEventBody =
 export type GlobalSessionEvent =
   | Extract<SessionUiEventBody, { type: "status.update" | "activity.update" | "session.name" | "session.created" }>
   | SessionNotificationSummaryEvent
-  | SessionUnreadEvent;
+  | SessionUnreadEvent
+  | SessionStartupProgressEvent;
 export type RealtimeEvent = GlobalSessionEvent | TerminalUiEvent | WorkspaceActivityUiEvent;

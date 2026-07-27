@@ -1,4 +1,5 @@
 import type { GitStatusFile } from "./api";
+import { pointerName, segmentName } from "./gitFileShared";
 
 /**
  * A changed file placed at a leaf of the Git file tree. `path` is the full
@@ -93,11 +94,6 @@ export function collectGitFileTreeDirectoryPaths(nodes: readonly GitFileTreeNode
   return paths;
 }
 
-function pointerName(file: GitStatusFile): string {
-  const from = file.submoduleFromCommit;
-  const to = file.submoduleToCommit;
-  return from !== undefined && to !== undefined ? `${from} → ${to}` : "commit";
-}
 
 function createDirectoryAccumulator(path: string): DirectoryAccumulator {
   return { path, directories: new Map(), files: [], isSubmodule: false };
@@ -124,10 +120,4 @@ function finalizeChildren(directory: DirectoryAccumulator): GitFileTreeNode[] {
     .sort((left, right) => left.name.localeCompare(right.name));
   const files = [...directory.files].sort((left, right) => left.name.localeCompare(right.name));
   return [...(directory.pointer === undefined ? [] : [directory.pointer]), ...directories, ...files];
-}
-
-function segmentName(path: string): string {
-  const segments = path.split("/");
-  const last = segments[segments.length - 1];
-  return last ?? path;
 }

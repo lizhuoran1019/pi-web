@@ -11,7 +11,7 @@ import { SessionSocket, type GlobalSessionEvent, type SessionUiEvent } from "../
 import { isArchivableSessionInfo, isTransientNewSessionInfo, sessionPersistenceOptionsForRuntime } from "../sessionPersistence";
 import { isSessionActive } from "../../../shared/activity";
 import { PI_WEB_CAPABILITIES, supportsPiWebCapability } from "../../../shared/capabilities";
-import type { PromptAttachmentDelivery, SessionNotificationInboxEvent } from "../../../shared/apiTypes";
+import type { PromptAttachmentDelivery, SessionNotificationInboxEvent, SessionStartupProgressEvent } from "../../../shared/apiTypes";
 import { InMemorySessionSelectionMemory, markSessionArchived, markSessionsArchived, selectPreferredSession, selectionAfterArchivingSession, selectionAfterArchivingSessions, shouldDeselectAfterArchivedCollapse, type SessionSelectionMemory } from "./sessionSelection";
 import { selectedMachineId, type GetState, type SetState, type UpdateUrl } from "./types";
 import { TrailingRefreshCoordinator } from "./trailingRefreshCoordinator";
@@ -140,6 +140,7 @@ export class SessionController {
     else if (event.type === "activity.update") this.queueActivityUpdate(event.activity);
     else if (event.type === "session.created") this.applyCreatedSession(event.session);
     else if (event.type === "session.name") this.applySessionName(event.sessionId, event.name);
+    else if (event.type === "session.startup") this.queueStartupProgress(event);
   }
 
   dispose() {
@@ -184,7 +185,7 @@ export class SessionController {
     this.pendingSessionStarts.set(pending.tempId, pending);
     this.insertAndSelectPendingSession(pending.session);
     try {
-      const session = await this.api.startSession(workspace.path, machineId);
+      const session = await this.api.startSession(workspace.path, machineId, pending.tempId);
       await this.resolvePendingSessionStart(pending.tempId, session);
     } catch (error) {
       this.failPendingSessionStart(pending.tempId, error);
@@ -1307,6 +1308,29 @@ export class SessionController {
     this.schedulePendingFlush();
   }
 
+  // Session startup progress arrives while the daemon is still constructing the
+  // session, so the target row is resolved by exact identity only: a session id
+  // the browser already knows (an open), else the correlation token this browser
+  // minted for its own create and the daemon echoed back. Matching neither means
+  // the row is not one this browser shows — an agent's or another tab's session is
+  // *deliberately* absent while a create is pending — so it is ignored rather than
+  // guessed at. A resolved row goes through the normal activity buffer, rendering
+  // like any other activity and staying batched per frame.
+  private queueStartupProgress(event: SessionStartupProgressEvent): void {
+    if (this.getState().sessions.some((session) => session.id === event.activity.sessionId)) {
+      this.queueActivityUpdate(event.activity);
+      return;
+    }
+    const pending = event.startupToken === undefined ? undefined : this.pendingSessionStarts.get(event.startupToken);
+    if (pending === undefined || pending.discarded) return;
+    // An idle startup phase means the daemon has nothing left to attribute, so
+    // restore this row's own generic wording rather than clearing the text of a
+    // creation request that has not returned yet.
+    this.queueActivityUpdate(event.activity.phase === "idle"
+      ? creatingPendingSessionActivity(pending.tempId, pending.queuedSends.length)
+      : pendingStartActivity(event.activity, pending.tempId));
+  }
+
   private schedulePendingFlush(): void {
     if (this.pendingFrame !== undefined) return;
     this.pendingFrame = requestAnimationFrame(() => {
@@ -1403,6 +1427,24 @@ function replacePendingSessionInList(sessions: readonly SessionInfo[], pendingSe
 
 function isClientPendingStartSessionInfo(session: SessionInfo | undefined): session is ClientPendingStartSessionInfo {
   return session !== undefined && "clientPendingStart" in session && session.clientPendingStart === true;
+}
+
+/**
+ * Re-label a startup report onto the browser's own pending create row.
+ *
+ * The daemon's startup marker is dropped: this row stands for a create the user
+ * asked for and is waiting on, which the browser has always reported as active
+ * work in progress, rather than for a session the daemon is opening. Only the
+ * phase text is borrowed, so the row keeps its own `creating · ` appearance.
+ */
+function pendingStartActivity(activity: SessionActivity, sessionId: string): SessionActivity {
+  return {
+    sessionId,
+    phase: activity.phase,
+    label: activity.label,
+    ...(activity.detail === undefined ? {} : { detail: activity.detail }),
+    at: activity.at,
+  };
 }
 
 function creatingPendingSessionActivity(sessionId: string, queuedCount = 0): SessionActivity {

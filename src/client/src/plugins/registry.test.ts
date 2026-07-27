@@ -249,6 +249,25 @@ describe("PluginRegistry", () => {
     expect(busy.find((action) => action.id === "core:session.reload")?.enabled).toBe(false);
   });
 
+  it("treats a session that is only starting up as having no work to stop or block", () => {
+    const registry = new PluginRegistry();
+    registry.register({ id: "core", plugin: corePlugin });
+    const reloadRuntime = { local: { machineId: "local", ok: true as const, checkedAt: "now", capabilities: [PI_WEB_CAPABILITIES.sessionsReload, PI_WEB_CAPABILITIES.sessionsPersistedState] } };
+    const startupActivity = { sessionId: "s1", phase: "active" as const, label: "Opening session", detail: "Starting the Pi session", at: "now", startup: true };
+
+    const opening = registry.getActions(createContext({ selectedSession: testSession({ persisted: true }), status: testStatus({ persisted: true }), activity: startupActivity, machineRuntimes: reloadRuntime }).context);
+
+    // Nothing is being worked on, so there is nothing to stop and no reason to
+    // block a reload with "Stop current session activity before reloading".
+    expect(opening.find((action) => action.id === "core:session.stop")?.enabled).toBe(false);
+    expect(opening.find((action) => action.id === "core:session.reload")?.enabled).toBe(true);
+
+    // Real work is still real work, whatever else the session is doing.
+    const working = registry.getActions(createContext({ selectedSession: testSession({ persisted: true }), status: testStatus({ persisted: true, isStreaming: true }), activity: startupActivity, machineRuntimes: reloadRuntime }).context);
+    expect(working.find((action) => action.id === "core:session.stop")?.enabled).toBe(true);
+    expect(working.find((action) => action.id === "core:session.reload")?.enabled).toBe(false);
+  });
+
   it("routes session reload through the runtime context", () => {
     const registry = new PluginRegistry();
     registry.register({ id: "core", plugin: corePlugin });

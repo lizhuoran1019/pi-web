@@ -78,6 +78,20 @@ export interface PiSessionLogger {
 
 const noopLogger: PiSessionLogger = { info() { /* no-op */ } };
 const DEFAULT_UNREAD_PUBLICATION_RETRY_MS = 1_000;
+/**
+ * User-facing names for the two phases of session startup PI WEB can prove it
+ * is inside: it awaits exactly one call for each, so the phase is a fact rather
+ * than a guess. Deliberately free of internal symbol names and file paths.
+ */
+const STARTUP_PHASE_RUNTIME = "Starting the Pi session";
+const STARTUP_PHASE_EXTENSIONS = "Loading session extensions";
+/**
+ * Appended to whichever phase is running when a background provider catalog
+ * refresh happens to be in flight. It is stated as a concurrent fact, never as
+ * the cause: PI WEB can verify that a refresh is running, but not that this
+ * particular startup is waiting on it.
+ */
+const STARTUP_CONCURRENT_CATALOG_REFRESH = "provider model lists are refreshing";
 const MAX_UNREAD_PUBLICATION_RETRY_MS = 30_000;
 const MAX_PENDING_UNREAD_MUTATIONS = SESSION_UNREAD_LIMIT + 1;
 
@@ -185,6 +199,11 @@ type SessionCreationProvenance = "tracked-subsession";
 interface StartSessionOptions {
   parentSession?: string;
   initialModel?: AgentModel;
+  /**
+   * Opaque label, echoed on this construction's startup progress so a browser
+   * row with no session id yet can recognise its own.
+   */
+  startupToken?: string;
 }
 
 interface InternalStartSessionOptions extends StartSessionOptions {
@@ -345,13 +364,13 @@ export interface PiAgentSession {
   setSessionName(name: string): void;
   /**
    * Narrow re-expression of `AgentSession.agent` (an `@earendil-works/pi-agent-core`
-   * `Agent`), exposing only `streamFn` — the resolved-auth/headers/retry "call this
-   * model" function pi's own compaction/branch-summarization code uses internally.
-   * Lets callers (e.g. session title generation) issue one-off model calls without
-   * depending on pi-ai's deprecated `/compat` provider registry or leaking the full
-   * `Agent`/`AgentSession` surface.
+   * `Agent`), exposing only `streamFunction` — the resolved-auth/headers/retry "call
+   * this model" function pi's own compaction/branch-summarization code uses
+   * internally. Lets callers (e.g. session title generation) issue one-off model
+   * calls without depending on pi-ai's deprecated `/compat` provider registry or
+   * leaking the full `Agent`/`AgentSession` surface.
    */
-  agent: { streamFn: StreamFn };
+  agent: { streamFunction: StreamFn };
 }
 
 export interface PiSessionRuntime {
@@ -376,9 +395,33 @@ interface PendingSessionOpen {
   promise: Promise<ActiveSession<PiSessionRuntime>>;
 }
 
-interface CreateSessionRuntimeOptions extends Pick<InternalStartSessionOptions, "initialModel" | "creationProvenance"> {
+interface CreateSessionRuntimeOptions extends Pick<InternalStartSessionOptions, "initialModel" | "creationProvenance" | "startupToken"> {
   notificationGeneration?: SessionNotificationGeneration;
   notifications?: "enabled" | "disabled";
+  /**
+   * What the user asked for, so startup progress can say "Creating" instead of
+   * "Opening". Only `startSession()` creates a brand new session; every other
+   * caller opens an existing one, so "open" is the default.
+   */
+  startupIntent?: "create" | "open";
+}
+
+/**
+ * Read-only view of the background catalog refresher, so session startup can
+ * state what it is concurrent with without being able to influence it.
+ */
+export interface CatalogRefreshStatus {
+  isRefreshInFlight(): boolean;
+}
+
+/**
+ * Publishes what a session startup is waiting on while it waits. Every call is
+ * synchronous and event-only, so reporting never adds an await to session
+ * creation and leaves no per-session state to unwind if creation fails.
+ */
+interface SessionStartupProgressReporter {
+  report(phase: string): void;
+  end(): void;
 }
 
 type NotificationClosePolicy =
@@ -587,7 +630,7 @@ function createDefaultRuntimeFactory(
   subsessions?: SubsessionToolDeps,
 ): PiWebCreateAgentSessionRuntimeFactory {
   return async ({ cwd, agentDir, sessionManager, sessionStartEvent, initialModel, delegationToolsEnabled }) => {
-    const services = await createAgentSessionServices({ cwd, agentDir, modelRuntime });
+    const services: AgentSessionServices = await createAgentSessionServices({ cwd, agentDir, modelRuntime });
     const resolvedDelegationToolsEnabled = delegationToolsEnabled
       ?? await sessionAllowsDelegationTools(sessionManager, sessionManagers);
     const customTools = createPiWebCustomToolDefinitions(cwd, resolvedDelegationToolsEnabled, spawn, subsessions);
@@ -658,6 +701,11 @@ export interface PiSessionServiceDependencies {
   unreadStore?: SessionUnreadStore;
   /** Initial retry delay for durable unread publication failures. */
   unreadPublicationRetryDelayMs?: number;
+  /**
+   * Lets session startup report that provider model lists are refreshing while
+   * a session is being constructed. Omit to report the startup phase alone.
+   */
+  catalogRefreshStatus?: CatalogRefreshStatus;
 }
 
 export class PiSessionService implements SessionRouteService {
@@ -705,6 +753,7 @@ export class PiSessionService implements SessionRouteService {
   private readonly notificationStore: SessionNotificationStore;
   private readonly notificationGenerationBySession = new WeakMap<PiAgentSession, SessionNotificationGeneration>();
   private readonly unreadStore: SessionUnreadStore;
+  private readonly catalogRefreshStatus: CatalogRefreshStatus | undefined;
   private readonly unreadPublicationRetryInitialMs: number;
   private readonly pendingUnreadMutations: SessionUnreadMutation[] = [];
   private unreadPublication: Promise<void> | undefined;
@@ -724,6 +773,7 @@ export class PiSessionService implements SessionRouteService {
     this.now = deps.now ?? (() => new Date());
     this.notificationStore = deps.notificationStore ?? new SessionNotificationStore();
     this.unreadStore = deps.unreadStore ?? new SessionUnreadStore();
+    this.catalogRefreshStatus = deps.catalogRefreshStatus;
     this.unreadPublicationRetryInitialMs = Math.max(
       0,
       deps.unreadPublicationRetryDelayMs ?? DEFAULT_UNREAD_PUBLICATION_RETRY_MS,
@@ -946,6 +996,8 @@ export class PiSessionService implements SessionRouteService {
       this.sessionManager.create(cwd, options.parentSession === undefined ? undefined : { parentSession: options.parentSession }),
       cwd,
       {
+        startupIntent: "create",
+        ...(options.startupToken === undefined ? {} : { startupToken: options.startupToken }),
         ...(options.initialModel === undefined ? {} : { initialModel: options.initialModel }),
         ...(options.creationProvenance === undefined ? {} : { creationProvenance: options.creationProvenance }),
       },
@@ -1400,7 +1452,7 @@ export class PiSessionService implements SessionRouteService {
 
   async availableModels(ref: PiSessionLookup): Promise<ClientSessionModel[]> {
     const session = await this.getOrOpen(ref);
-    await session.modelRuntime.reloadConfig();
+    await session.modelRuntime.refresh();
     const models = session.scopedModels.length > 0
       ? session.scopedModels.map((scoped) => scoped.model)
       : session.modelRuntime.getAvailableSnapshot();
@@ -1411,7 +1463,7 @@ export class PiSessionService implements SessionRouteService {
     await this.assertWritable(ref);
     const session = await this.getOrOpen(ref);
     this.assertTreeNavigationInactive(session, "change models");
-    await session.modelRuntime.reloadConfig();
+    await session.modelRuntime.refresh();
     this.assertTreeNavigationInactive(session, "change models");
     const candidates = session.scopedModels.length > 0
       ? session.scopedModels.map((scoped) => scoped.model)
@@ -2295,11 +2347,33 @@ export class PiSessionService implements SessionRouteService {
     return undefined;
   }
 
+  /**
+   * Construct a session while telling waiting browsers which phase of startup
+   * they are waiting on. The reporting wraps the *whole* construction rather
+   * than the inner bookkeeping `try`, because the runtime construction that runs
+   * first is both the slowest phase and one that can fail on its own; a clear
+   * that only ran for the later phases would leave a stale label behind.
+   */
   private async create(
     sessionManager: PiSessionManager,
     cwd: string,
     options: CreateSessionRuntimeOptions = {},
   ): Promise<ActiveSession<PiSessionRuntime>> {
+    const startup = this.startupProgress(sessionManager, options.startupIntent ?? "open", options.startupToken);
+    try {
+      return await this.createSessionRuntime(sessionManager, cwd, options, startup);
+    } finally {
+      startup.end();
+    }
+  }
+
+  private async createSessionRuntime(
+    sessionManager: PiSessionManager,
+    cwd: string,
+    options: CreateSessionRuntimeOptions,
+    startup: SessionStartupProgressReporter,
+  ): Promise<ActiveSession<PiSessionRuntime>> {
+    startup.report(STARTUP_PHASE_RUNTIME);
     const delegationToolsEnabled = options.creationProvenance !== "tracked-subsession"
       && await sessionAllowsDelegationTools(sessionManager, this.sessionManager);
     const runtime = await this.createAgentRuntime(this.createRuntime, {
@@ -2347,6 +2421,7 @@ export class PiSessionService implements SessionRouteService {
       } else {
         await this.recoverSubsessionTrackingForOpenedSession(runtime.session);
       }
+      startup.report(STARTUP_PHASE_EXTENSIONS);
       await this.bindSessionExtensions(runtime.session, notificationGeneration);
       this.bindRuntime(active);
       runtime.setRebindSession(async (session) => {
@@ -2696,7 +2771,7 @@ export class PiSessionService implements SessionRouteService {
     const model = session.model;
     if (model === undefined) return;
 
-    void generateShortSessionName(session.agent.streamFn, model, firstMessage).then((name) => {
+    void generateShortSessionName(session.agent.streamFunction, model, firstMessage).then((name) => {
       this.applyGeneratedSessionName(session, name ?? fallbackSessionName(firstMessage));
     }).catch(() => {
       this.applyGeneratedSessionName(session, fallbackSessionName(firstMessage));
@@ -2925,6 +3000,55 @@ export class PiSessionService implements SessionRouteService {
     if (eventType === "bash_execution_start") { this.publishActivity(session, "running bash", "active"); return; }
     if (eventType === "bash_execution_end") { this.publishActivity(session, "bash complete", "idle"); return; }
     if (this.hasActiveWork(session)) this.publishActivity(session, eventType.replaceAll("_", " "), "active");
+  }
+
+  /**
+   * Build the reporter for one session construction.
+   *
+   * The session id is known before any await — a `SessionManager` has its id
+   * from construction — so the daemon can name what it is starting even though
+   * the `PiAgentSession` that {@link publishActivity} needs does not exist yet.
+   * Without an id there is nothing to report against, so the reporter stays
+   * silent and the browser keeps its own generic wording.
+   */
+  private startupProgress(sessionManager: PiSessionManager, intent: "create" | "open", startupToken: string | undefined): SessionStartupProgressReporter {
+    const sessionId = sessionManager.getSessionId();
+    if (sessionId === "") return { report: noop, end: noop };
+    const label = intent === "create" ? "Creating session" : "Opening session";
+    return {
+      report: (phase) => { this.publishStartupProgress(sessionId, startupToken, label, "active", this.startupDetail(phase)); },
+      end: () => {
+        // A real activity published during the window (an extension error, say)
+        // is the truth about this session and must survive the clear.
+        if (this.activities.has(sessionId)) return;
+        this.publishStartupProgress(sessionId, startupToken, "idle", "idle", undefined);
+      },
+    };
+  }
+
+  private startupDetail(phase: string): string {
+    return this.catalogRefreshStatus?.isRefreshInFlight() === true
+      ? `${phase} · ${STARTUP_CONCURRENT_CATALOG_REFRESH}`
+      : phase;
+  }
+
+  /**
+   * Report startup progress on the global channel only, echoing the caller's
+   * correlation token so a waiting browser row recognises its own construction.
+   *
+   * Unlike {@link publishActivity} this deliberately records nothing: no
+   * `activities` entry, no workspace activity, no unread observation. There is
+   * no session to own that state, and a failed creation would leave it stranded.
+   *
+   * Every report is marked `startup`, which is what keeps a session that is
+   * merely opening from counting as one doing work. This is the only publisher
+   * that sets the marker, and because it writes no `activities` entry no later
+   * heartbeat re-publication can carry it.
+   */
+  private publishStartupProgress(sessionId: string, startupToken: string | undefined, label: string, phase: "active" | "idle", detail: string | undefined): void {
+    const at = new Date().toISOString();
+    const activity = detail === undefined ? { sessionId, phase, label, at, startup: true } : { sessionId, phase, label, detail, at, startup: true };
+    this.events.publishGlobal(startupToken === undefined ? { type: "session.startup", activity } : { type: "session.startup", startupToken, activity });
   }
 
   private publishActivity(session: PiAgentSession, label: string, phase: "active" | "idle" | "error", detail?: string): void {

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { GitDiffResponse, GitFileState, GitStatusFile, GitStatusResponse } from "../../shared/apiTypes.js";
 import { normalizeRelativePath } from "../workspaces/pathSafety.js";
@@ -49,34 +50,18 @@ export async function gitStatus(cwd: string): Promise<GitStatusResponse> {
  * unchanged) is intentionally not surfaced as a pointer entry.
  */
 async function expandSubmodules(cwd: string, parsed: ParsedStatus, topRaw: string): Promise<GitStatusResponse> {
-  const files: GitStatusFile[] = [...parsed.files];
-  const submodulePaths: string[] = [];
-  let extraForHash = "";
+  // Fan out concurrently — one `git status` per dirty submodule plus one
+  // `git rev-parse` per unstaged pointer move — then concatenate in input
+  // order so the file list and hash are identical to a serial pass.
+  const expanded = await Promise.all(parsed.submodules.map(async (sub) => ({ path: sub.path, ...(await expandSubmodule(cwd, sub)) })));
 
-  for (const sub of parsed.submodules) {
-    submodulePaths.push(sub.path);
-    if (sub.commitChanged) {
-      files.push({
-        path: sub.path,
-        index: sub.index,
-        workingTree: sub.workingTree,
-        submoduleFromCommit: short(sub.headOid),
-        submoduleToCommit: short(await resolveSubmoduleToCommit(cwd, sub)),
-      });
-    }
-    if (sub.hasModifiedContent || sub.hasUntrackedContent) {
-      const inner = await runGit(join(cwd, sub.path), ["status", "--porcelain=v2", "--untracked-files=all", "-z"]);
-      if (inner.code !== 0) continue; // uninitialized / unreadable submodule: skip silently
-      extraForHash += `\0${sub.path}\0${inner.stdout}`;
-      const innerFiles = parseStatus(inner.stdout, { deferSubmodules: false }).files;
-      for (const file of innerFiles) {
-        files.push({
-          ...file,
-          path: `${sub.path}/${file.path}`,
-          ...(file.oldPath === undefined ? {} : { oldPath: `${sub.path}/${file.oldPath}` }),
-        });
-      }
-    }
+  const files: GitStatusFile[] = [...parsed.files];
+  const dirtySubmodulePaths: string[] = [];
+  let extraForHash = "";
+  for (const part of expanded) {
+    dirtySubmodulePaths.push(part.path);
+    files.push(...part.files);
+    extraForHash += part.extraForHash;
   }
 
   return {
@@ -87,10 +72,40 @@ async function expandSubmodules(cwd: string, parsed: ParsedStatus, topRaw: strin
     ...(parsed.ahead === undefined ? {} : { ahead: parsed.ahead }),
     ...(parsed.behind === undefined ? {} : { behind: parsed.behind }),
     files,
-    submodules: submodulePaths,
+    submodules: dirtySubmodulePaths,
   };
 }
 
+/** Expand one dirty submodule: the pointer entry first, then its inner files. */
+async function expandSubmodule(cwd: string, sub: SubmoduleRecord): Promise<{ files: GitStatusFile[]; extraForHash: string }> {
+  const files: GitStatusFile[] = [];
+  let extraForHash = "";
+  if (sub.commitChanged) {
+    files.push({
+      path: sub.path,
+      index: sub.index,
+      workingTree: sub.workingTree,
+      submoduleFromCommit: displayFromCommit(sub.headOid),
+      submoduleToCommit: short(await resolveSubmoduleToCommit(cwd, sub)),
+    });
+  }
+  if (sub.hasModifiedContent || sub.hasUntrackedContent) {
+    const inner = await runGit(join(cwd, sub.path), ["status", "--porcelain=v2", "--untracked-files=all", "-z"]);
+    if (inner.code === 0) {
+      extraForHash = `\0${sub.path}\0${inner.stdout}`;
+      const innerFiles = parseStatus(inner.stdout, { deferSubmodules: false }).files;
+      for (const file of innerFiles) {
+        files.push({
+          ...file,
+          path: `${sub.path}/${file.path}`,
+          ...(file.oldPath === undefined ? {} : { oldPath: `${sub.path}/${file.oldPath}` }),
+        });
+      }
+    }
+    // non-zero exit: uninitialized / unreadable submodule — skip silently
+  }
+  return { files, extraForHash };
+}
 async function resolveSubmoduleToCommit(cwd: string, sub: SubmoduleRecord): Promise<string> {
   // Staged pointer moves already expose the new commit as the index OID; an
   // unstaged move only records the old OID, so read the submodule's HEAD.
@@ -154,23 +169,30 @@ async function isUntracked(cwd: string, path: string): Promise<boolean> {
 }
 
 /** Configured direct-submodule paths (depth 1), read from `.gitmodules`. */
-async function submodulePaths(cwd: string): Promise<string[]> {
-  const result = await runGit(cwd, ["config", "--file", ".gitmodules", "--get-regexp", "^submodule\\..+\\.path$"]);
+async function configuredSubmodulePaths(cwd: string): Promise<string[]> {
+  // `-z` emits `<key>\n<value>\0` records; keys may themselves contain spaces
+  // (`submodule.my sub.path`), so splitting lines at the first space mangles
+  // paths with spaces in them.
+  const result = await runGit(cwd, ["config", "-z", "--file", ".gitmodules", "--get-regexp", "^submodule\\..+\\.path$"]);
   if (result.code !== 0) return [];
   const paths: string[] = [];
-  for (const line of result.stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
-    const spaceAt = trimmed.indexOf(" ");
-    if (spaceAt === -1) continue;
-    paths.push(trimmed.slice(spaceAt + 1));
+  for (const record of result.stdout.split("\0")) {
+    if (record === "") continue;
+    const newlineAt = record.indexOf("\n");
+    if (newlineAt === -1) continue;
+    paths.push(record.slice(newlineAt + 1));
   }
   return paths;
 }
 
 /** The submodule that strictly contains `path`, if any (longest match wins). */
 async function submoduleForPath(cwd: string, path: string): Promise<string | undefined> {
-  const subs = await submodulePaths(cwd);
+  // Cheap bail-outs before spawning `git config`: a path strictly inside a
+  // submodule always contains `/`, and without `.gitmodules` there are no
+  // configured submodules to look up (every diff call used to pay this spawn).
+  if (!path.includes("/")) return undefined;
+  if (!existsSync(join(cwd, ".gitmodules"))) return undefined;
+  const subs = await configuredSubmodulePaths(cwd);
   let best: string | undefined;
   for (const sub of subs) {
     if (sub !== "" && path.startsWith(`${sub}/`) && (best === undefined || sub.length > best.length)) best = sub;
@@ -201,19 +223,28 @@ function parseStatus(raw: string, options: { deferSubmodules: boolean }): Parsed
       const parts = record.split(" ");
       const sub = parts[2];
       const path = parts.slice(8).join(" ");
-      if (options.deferSubmodules && sub?.startsWith("S") === true) {
+      const index = stateFor(parts[1]?.[0]);
+      const workingTree = stateFor(parts[1]?.[1]);
+      // A deleted gitlink has no pointer move or inner content to expand (a
+      // staged deletion even reports the index OID as all zeros), so keep it
+      // as a plain row instead of deferring it as a submodule.
+      if (options.deferSubmodules && sub?.startsWith("S") === true && index !== "deleted" && workingTree !== "deleted") {
+        const headOid = parts[6] ?? "";
+        const indexOid = parts[7] ?? "";
         submodules.push({
           path,
-          index: stateFor(parts[1]?.[0]),
-          workingTree: stateFor(parts[1]?.[1]),
-          commitChanged: sub[1] === "C",
+          index,
+          workingTree,
+          // `c` only flags unstaged moves (submodule HEAD left the index OID);
+          // a staged move leaves HEAD == index, so compare the recorded OIDs.
+          commitChanged: sub[1] === "C" || headOid !== indexOid,
           hasModifiedContent: sub[2] === "M",
           hasUntrackedContent: sub[3] === "U",
-          headOid: parts[6] ?? "",
-          indexOid: parts[7] ?? "",
+          headOid,
+          indexOid,
         });
       } else {
-        files.push({ path, index: stateFor(parts[1]?.[0]), workingTree: stateFor(parts[1]?.[1]) });
+        files.push({ path, index, workingTree });
       }
     } else if (record.startsWith("2 ")) {
       const parts = record.split(" ");
@@ -252,6 +283,10 @@ function short(oid: string): string {
   return oid.slice(0, 7);
 }
 
+/** A newly staged submodule records an all-zero head OID; display the pointer as `new → <sha>`. */
+function displayFromCommit(headOid: string): string {
+  return /^0+$/.test(headOid) ? "new" : short(headOid);
+}
 function hash(value: string): string {
   return createHash("sha1").update(value).digest("hex");
 }

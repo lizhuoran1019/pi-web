@@ -40,7 +40,12 @@ export type SessionRouteLookup = string | SessionRouteRef;
  */
 export interface SessionRouteService {
   list(cwd: string): Promise<ClientSession[]>;
-  start(cwd: string): Promise<ClientSession>;
+  /**
+   * Create a session. `startupToken` is an opaque label the caller supplies so
+   * it can recognise this construction's startup progress reports; the service
+   * echoes it and never interprets it.
+   */
+  start(cwd: string, options?: { startupToken?: string }): Promise<ClientSession>;
   messages(ref: SessionRouteLookup, page?: { before?: number; limit?: number }): Promise<unknown[] | ClientMessagePage>;
   status(ref: SessionRouteLookup): Promise<ClientSessionStatus>;
   streamSnapshot(ref: SessionRouteLookup): Promise<SessionStreamSnapshot>;

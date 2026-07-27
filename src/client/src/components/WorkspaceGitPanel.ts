@@ -13,6 +13,11 @@ interface GitViewState {
   readonly expandablePaths: readonly string[];
 }
 
+interface GitViewStateCache {
+  readonly status: GitStatusResponse | undefined;
+  readonly view: GitFileView;
+  readonly viewState: GitViewState;
+}
 const EMPTY_LIST_MODEL: GitFileListModel = { submodules: [], files: [] };
 const EMPTY_VIEW_STATE: GitViewState = { nodes: [], listModel: EMPTY_LIST_MODEL, expandablePaths: [] };
 
@@ -45,6 +50,10 @@ export class WorkspaceGitPanel extends LitElement {
   // submodule groups, both keyed by their path.
   @state() private expandedDirectories = new Set<string>();
 
+  // Memoized on (status, view) identity: renders triggered by expand/collapse
+  // or diff selection reuse the model, while a new poll or view switch rebuilds
+  // it. Expand state is read live at render time, never baked into the model.
+  private viewStateCache: GitViewStateCache | undefined;
   protected override willUpdate(changedProperties: PropertyValues<this>): void {
     if (!changedProperties.has("context")) return;
     const previous = changedProperties.get("context");
@@ -64,13 +73,13 @@ export class WorkspaceGitPanel extends LitElement {
         <strong>Git</strong>
         ${context.gitStale ? html`<span class="stale">stale</span>` : null}
         <div class="toolbar-actions">
-          ${this.renderViewToggle()}
           ${viewState.expandablePaths.length > 0 ? this.renderExpandCollapseAll(viewState.expandablePaths) : null}
+          ${this.renderViewToggle()}
           <button type="button" @click=${context.onRefreshGit}>Refresh</button>
         </div>
       </section>
       <section class="split">
-        <div class=${this.view === "tree" ? "list tree" : "list"}>
+        <div class="list">
           ${this.renderFileList(context, status, viewState)}
         </div>
         <div class="viewer">${renderDiffViewer(context)}</div>
@@ -166,6 +175,14 @@ export class WorkspaceGitPanel extends LitElement {
   }
 
   private computeViewState(status: GitStatusResponse | undefined): GitViewState {
+    const cached = this.viewStateCache;
+    if (cached !== undefined && cached.status === status && cached.view === this.view) return cached.viewState;
+    const viewState = this.buildViewState(status);
+    this.viewStateCache = { status, view: this.view, viewState };
+    return viewState;
+  }
+
+  private buildViewState(status: GitStatusResponse | undefined): GitViewState {
     if (status === undefined || !status.isGitRepo || status.files.length === 0) return EMPTY_VIEW_STATE;
     if (this.view === "tree") {
       const nodes = buildGitFileTree(status.files, status.submodules);

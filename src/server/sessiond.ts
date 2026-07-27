@@ -7,7 +7,9 @@ import { WorkspaceActivityService } from "./activity/workspaceActivityService.js
 import { registerWorkspaceActivityRoutes } from "./activity/workspaceActivityRoutes.js";
 import { SessionEventHub } from "./realtime/sessionEventHub.js";
 import { AuthService } from "./sessions/authService.js";
+import { bootstrapAndFreezeGlobalExtensionProviders } from "./sessions/globalProviderPolicy.js";
 import { registerAuthRoutes } from "./sessions/authRoutes.js";
+import { ModelCatalogRefresher } from "./sessions/modelCatalogRefresher.js";
 import { PiSessionService } from "./sessions/piSessionService.js";
 import { createPiSessionManagerGateway } from "./sessions/piSessionManagerGateway.js";
 import { registerSessionRoutes } from "./sessions/sessionRoutes.js";
@@ -22,9 +24,10 @@ import { TerminalService } from "./terminals/terminalService.js";
 import { registerTerminalRoutes } from "./terminals/terminalRoutes.js";
 import { getPiWebRuntimeComponent } from "./piWebStatus.js";
 import { SESSIOND_RUNTIME_CAPABILITIES } from "../shared/capabilities.js";
-import { agentSessionDirEnvKeys, effectivePiWebConfig, maxUploadBytes } from "../config.js";
+import { agentSessionDirEnvKeys, effectivePiWebConfig, maxUploadBytes, offlineModeEnabled } from "../config.js";
 import { createActiveAgentProfileDescriptor } from "../sessiond/activeAgentProfile.js";
 import { runSessionDaemonStartup } from "./sessiond/sessionDaemonStartup.js";
+import { sessionServiceDependencies } from "./sessiond/sessionServiceDependencies.js";
 
 const daemonEnvironment: NodeJS.ProcessEnv = Object.freeze({ ...process.env });
 const { config } = effectivePiWebConfig({ env: daemonEnvironment });
@@ -50,31 +53,47 @@ await runSessionDaemonStartup({
     await unreadStore.load();
     const workspaceActivity = new WorkspaceActivityService(eventHub);
     const auth = await AuthService.create({ agentDir: activeAgentProfile.dir, logger: app.log });
+    // Capture providers registered by global extensions while the runtime is
+    // still mutable, then freeze every later extension-provider mutation before
+    // any real session can load project resources.
+    await bootstrapAndFreezeGlobalExtensionProviders(auth.runtime, activeAgentProfile.dir, app.log);
+    // The shared model runtime is constructed offline so request paths never
+    // wait on provider-catalog fetches; this is the single bounded network
+    // refresher, and auth changes (login/logout) ask it for a prompt run. It
+    // stays fully inert when the operator asked for offline behavior.
+    const catalogRefresher = new ModelCatalogRefresher({
+      runtime: auth.runtime,
+      logger: app.log,
+      offline: offlineModeEnabled(daemonEnvironment),
+    });
+    catalogRefresher.start();
+    auth.subscribe(() => { catalogRefresher.requestRefresh(); });
     const spawnTargets = config.spawnSessions
       ? new ProjectScopedSpawnTargetResolver({ projects: new ProjectService(new ProjectStore()), workspaces: new WorkspaceService() })
       : undefined;
-    const sessions = new PiSessionService(eventHub, {
+    const sessions = new PiSessionService(eventHub, sessionServiceDependencies({
       modelRuntime: auth.runtime,
       agentDir: activeAgentProfile.dir,
       workspaceActivity,
       logger: app.log,
       ...(spawnTargets === undefined ? {} : { spawnTargets }),
-      subsessionsEnabled: spawnTargets !== undefined && config.subsessions,
+      subsessionsEnabled: config.subsessions,
       notificationStore,
       unreadStore,
+      catalogRefreshStatus: catalogRefresher,
       sessionManager: createPiSessionManagerGateway({
         agentDir: activeAgentProfile.dir,
         env: daemonEnvironment,
         sessionDirEnvKeys: activeAgentProfile.sessionDirEnvKeys,
       }),
-    });
+    }));
     auth.subscribe((change) => { sessions.applyAuthChange(change); });
     const terminals = new TerminalService(eventHub, workspaceActivity);
     const runtimeComponent = Object.freeze({
       ...getPiWebRuntimeComponent("sessiond", SESSIOND_RUNTIME_CAPABILITIES),
       activeAgentProfile,
     });
-    return { eventHub, workspaceActivity, auth, sessions, terminals, unreadStore, activeAgentProfile, runtimeComponent };
+    return { eventHub, workspaceActivity, auth, sessions, terminals, unreadStore, activeAgentProfile, runtimeComponent, catalogRefresher };
   },
   registerRoutes({ eventHub, workspaceActivity, auth, sessions, terminals, runtimeComponent }) {
     registerWorkspaceActivityRoutes(app, workspaceActivity);
@@ -97,7 +116,7 @@ await runSessionDaemonStartup({
 
     app.get("/runtime", () => runtimeComponent);
   },
-  async listen({ auth, sessions, terminals, unreadStore }) {
+  async listen({ auth, sessions, terminals, unreadStore, catalogRefresher }) {
     let shuttingDown = false;
     async function shutdown(signal: NodeJS.Signals): Promise<void> {
       if (shuttingDown) return;
@@ -112,6 +131,7 @@ await runSessionDaemonStartup({
         }
       };
       await attempt("dispose terminals", () => { terminals.dispose(); });
+      await attempt("dispose catalog refresher", () => { catalogRefresher.dispose(); });
       await attempt("dispose auth", () => { auth.dispose(); });
       await attempt("dispose sessions", () => sessions.dispose());
       await attempt("flush session unread state", () => unreadStore.flush());

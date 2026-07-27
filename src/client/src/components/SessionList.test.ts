@@ -16,6 +16,14 @@ describe("sessionRowActivityKind", () => {
     expect(sessionRowActivityKind(session("s"), { ...idle, isStreaming: true }, undefined, false)).toBe("session");
   });
 
+  it("shows no active-work indicator for a session that is only starting up", () => {
+    const startup = { sessionId: "s", phase: "active" as const, label: "Opening session", detail: "Starting the Pi session", at: "now", startup: true };
+
+    expect(sessionRowActivityKind(session("s"), idle, startup, false)).toBeUndefined();
+    // Ordinary activity is work and keeps its indicator.
+    expect(sessionRowActivityKind(session("s"), idle, { sessionId: "s", phase: "active", label: "running tool", at: "now" }, false)).toBe("session");
+  });
+
   it("reports unread only while the session is idle", () => {
     expect(sessionRowActivityKind(session("s"), idle, undefined, false, true)).toBe("unread");
     expect(sessionRowActivityKind(session("s"), { ...idle, isStreaming: true }, undefined, false, true)).toBe("session");

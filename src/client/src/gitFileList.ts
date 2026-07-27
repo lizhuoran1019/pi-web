@@ -1,4 +1,5 @@
 import type { GitStatusFile } from "./api";
+import { pointerName, segmentName } from "./gitFileShared";
 
 /** A changed file inside a submodule, shown flat in list view. `path` is the
  * full superproject-relative path (the diff key); `relativePath` is shown in
@@ -69,16 +70,4 @@ function ownerSubmodule(path: string, submodules: readonly string[]): string | u
     if (submodule !== "" && path.startsWith(`${submodule}/`) && (best === undefined || submodule.length > best.length)) best = submodule;
   }
   return best;
-}
-
-function pointerName(file: GitStatusFile): string {
-  const from = file.submoduleFromCommit;
-  const to = file.submoduleToCommit;
-  return from !== undefined && to !== undefined ? `${from} → ${to}` : "commit";
-}
-
-function segmentName(path: string): string {
-  const segments = path.split("/");
-  const last = segments[segments.length - 1];
-  return last ?? path;
 }

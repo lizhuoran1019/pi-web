@@ -26,6 +26,7 @@ import { PiSessionService, type PiSessionManagerGateway } from "./piSessionServi
 import { testModelRuntime } from "./piSessionService.testSupport.js";
 import { SessionNotificationStore } from "./sessionNotificationStore.js";
 import type { SessionRouteLookup, SessionRouteService } from "./sessionService.js";
+import type { ClientSession } from "../types.js";
 import { registerSessionRoutes } from "./sessionRoutes.js";
 import type { NormalizedSessionCleanupRequest } from "./sessionCleanup.js";
 
@@ -666,6 +667,35 @@ describe("session routes", () => {
     }
   });
 
+  it("forwards a create's optional correlation token alongside the normalized cwd", async () => {
+    const routeApp = Fastify({ logger: false });
+    await routeApp.register(fastifyWebsocket);
+    const eventHub = new SessionEventHub();
+    const routeService = new CapturingRouteSessionService();
+    registerSessionRoutes(routeApp, routeService, eventHub);
+
+    try {
+      const requestCwd = resolve("/repo");
+      const withToken = await routeApp.inject({ method: "POST", url: "/sessions", payload: { cwd: requestCwd, startupToken: "pending-session-3-k2x9" } });
+      const withoutToken = await routeApp.inject({ method: "POST", url: "/sessions", payload: { cwd: requestCwd } });
+      // An older browser, or any non-browser caller, sends no token; and a
+      // malformed one must not reach the service as a label it would echo.
+      const malformedToken = await routeApp.inject({ method: "POST", url: "/sessions", payload: { cwd: requestCwd, startupToken: 7 } });
+
+      expect(withToken.statusCode).toBe(200);
+      expect(withoutToken.statusCode).toBe(200);
+      expect(malformedToken.statusCode).toBe(400);
+      expect(malformedToken.json()).toEqual({ error: "startupToken field must be a string" });
+      expect(routeService.startCalls).toEqual([
+        { cwd: requestCwd, startupToken: "pending-session-3-k2x9" },
+        { cwd: requestCwd, startupToken: undefined },
+      ]);
+    } finally {
+      await routeService.dispose();
+      await routeApp.close();
+    }
+  });
+
   it("rejects malformed bulk mutation bodies before calling the service", async () => {
     const routeApp = Fastify({ logger: false });
     await routeApp.register(fastifyWebsocket);
@@ -706,6 +736,7 @@ class CapturingRouteSessionService implements SessionRouteService {
   readonly bulkArchiveCalls: SessionBulkMutationRef[][] = [];
   readonly bulkDeleteCalls: SessionBulkMutationRef[][] = [];
   readonly navigateTreeCalls: { lookup: SessionRouteLookup; request: SessionTreeNavigateRequest }[] = [];
+  readonly startCalls: { cwd: string; startupToken: string | undefined }[] = [];
   reloadError: Error | undefined;
   clearQueueError: Error | undefined;
 
@@ -772,7 +803,11 @@ class CapturingRouteSessionService implements SessionRouteService {
   }
 
   list(): never { throw unusedRouteMethod("list"); }
-  start(): never { throw unusedRouteMethod("start"); }
+
+  start(cwd: string, options?: { startupToken?: string }): Promise<ClientSession> {
+    this.startCalls.push({ cwd, startupToken: options?.startupToken });
+    return Promise.resolve({ id: "session-1", path: "/tmp/session-1.jsonl", cwd, created: "2026-06-25T00:00:00.000Z", modified: "2026-06-25T00:00:00.000Z", messageCount: 0, firstMessage: "" });
+  }
 
   dismissWarning(lookup: SessionRouteLookup, dismissId: string): Promise<SessionStatus> {
     this.dismissWarningCalls.push({ lookup, dismissId });
