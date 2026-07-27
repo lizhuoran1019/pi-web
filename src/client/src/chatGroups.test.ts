@@ -87,6 +87,14 @@ describe("groupChatMessages", () => {
     ]);
   });
 
+  it("preserves entry ids when grouping messages", () => {
+    const message: ChatLine = { role: "user", parts: [{ type: "text", text: "hello" }], entryId: "entry-1" };
+
+    expect(groupChatMessages([message])).toEqual([
+      { kind: "message", index: 0, message },
+    ]);
+  });
+
   it("treats compaction and branch summaries as grouped events", () => {
     const messages: ChatLine[] = [
       { ...text("assistant", "summary"), source: "compaction" },

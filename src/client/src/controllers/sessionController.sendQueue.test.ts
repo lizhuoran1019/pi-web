@@ -201,7 +201,9 @@ describe("SessionController send queue", () => {
       messages: () => Promise.resolve(emptyPage),
       status: (session) => Promise.resolve(status(sessionLookupId(session))),
       runCommand: (session, text) => {
-        calls.push(`command:${sessionLookupId(session)}:${text}`);
+        // Selecting a session reads its branch structure through `/tree`; that
+        // background read is not queued user input.
+        if (text !== "/tree") calls.push(`command:${sessionLookupId(session)}:${text}`);
         return Promise.resolve({ type: "done" });
       },
       shell: (session, text) => {
