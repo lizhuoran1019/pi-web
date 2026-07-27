@@ -1,4 +1,4 @@
-import type { SessionTreeNode, SessionTreeSnapshot, SessionTreeSummaryChoice } from "./api";
+import type { SessionTreeNode, SessionTreeNodeKind, SessionTreeSnapshot, SessionTreeSummaryChoice } from "./api";
 import { SESSION_TREE_CUSTOM_INSTRUCTIONS_MAX_LENGTH } from "../../shared/apiTypes";
 
 export interface SessionTreeModel {
@@ -21,6 +21,19 @@ export interface SessionTreeRow {
   readonly childIds: readonly string[];
   readonly activePath: boolean;
   readonly activeLeaf: boolean;
+}
+
+/**
+ * The branch alternatives that exist at one entry on the active path: which one
+ * is showing, how many there are, and where to navigate to reach the neighbours.
+ */
+export interface SessionTreeBranchPosition {
+  /** 1-based position of the shown branch among the alternatives, oldest first. */
+  readonly index: number;
+  readonly total: number;
+  /** Navigation target that shows the previous alternative, or `undefined` when there is none to switch to. */
+  readonly olderTargetId: string | undefined;
+  readonly newerTargetId: string | undefined;
 }
 
 export interface SessionTreeKeyState {
@@ -135,6 +148,74 @@ export function visibleSessionTreeRows(model: SessionTreeModel, foldedIds: Reado
   }
 
   return rows;
+}
+
+/**
+ * Branch alternatives for every active-path entry that has siblings, keyed by
+ * entry id. Only the active path can be on screen, so nothing else is computed.
+ *
+ * An entry's alternatives are its siblings: forking a session appends the new
+ * branch as another child of the same parent. Entries with no parent are each
+ * other's alternatives too, which is what re-editing the very first message
+ * produces (pi resets the leaf and starts a new root).
+ */
+export function sessionTreeBranchPositions(model: SessionTreeModel): ReadonlyMap<string, SessionTreeBranchPosition> {
+  const positions = new Map<string, SessionTreeBranchPosition>();
+  for (const id of model.activePathIds) {
+    const parentId = model.parentById.get(id) ?? null;
+    const siblings = parentId === null ? model.rootIds : model.childrenById.get(parentId) ?? [];
+    if (siblings.length < 2) continue;
+    const index = siblings.indexOf(id);
+    if (index < 0) continue;
+    positions.set(id, {
+      index: index + 1,
+      total: siblings.length,
+      olderTargetId: sessionTreeBranchTargetId(model, siblings[index - 1]),
+      newerTargetId: sessionTreeBranchTargetId(model, siblings[index + 1]),
+    });
+  }
+  return positions;
+}
+
+/**
+ * The entry to navigate to in order to show `branchRootId`'s branch.
+ *
+ * Not the branch root itself: pi reads a user or custom-message target as "re-edit
+ * this message" and moves the leaf to that target's *parent*, which would leave
+ * the branch off screen. So the target is the newest entry in the branch that pi
+ * will switch to outright. The transport projection is a pre-order walk and
+ * children are in creation order, so scanning the branch's own pre-order
+ * backwards reaches the newest work first, falling back to earlier forks when the
+ * newest one holds nothing switchable. `undefined` means the whole branch is
+ * still unanswered and cannot be shown yet.
+ */
+function sessionTreeBranchTargetId(model: SessionTreeModel, branchRootId: string | undefined): string | undefined {
+  if (branchRootId === undefined) return undefined;
+  const preOrder: string[] = [];
+  const visited = new Set<string>();
+  const stack = [branchRootId];
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (id === undefined || visited.has(id)) continue;
+    visited.add(id);
+    preOrder.push(id);
+    const children = model.childrenById.get(id) ?? [];
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const childId = children[index];
+      if (childId !== undefined) stack.push(childId);
+    }
+  }
+  for (let index = preOrder.length - 1; index >= 0; index -= 1) {
+    const id = preOrder[index];
+    if (id === undefined) continue;
+    const kind = model.nodesById.get(id)?.kind;
+    if (kind !== undefined && isSessionTreeBranchTargetKind(kind)) return id;
+  }
+  return undefined;
+}
+
+function isSessionTreeBranchTargetKind(kind: SessionTreeNodeKind): boolean {
+  return kind !== "user" && kind !== "custom-message";
 }
 
 export function initialSessionTreeSelection(model: SessionTreeModel): string | undefined {

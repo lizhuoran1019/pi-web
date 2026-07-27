@@ -1,11 +1,48 @@
 import { describe, expect, it } from "vitest";
 import { initialAppState } from "../appState";
 import { SessionController } from "./sessionController";
+import type { CommandResult, SessionTreeSnapshot } from "../api";
 import { defaultApi, deferred, FakeSocket, oldSession, replacementSession, sessionLookupId, status, workspace, type AppState, type MessagePage, type SessionStatus } from "./sessionController.testSupport";
 
 function page(text: string, total: number): MessagePage {
   return { messages: [{ role: "assistant", content: text }], start: 0, total };
 }
+
+describe("SessionController session tree refresh", () => {
+  const tree: SessionTreeSnapshot = {
+    nodes: [{ id: "entry-1", parentId: null, kind: "user", summary: "ask" }],
+    activeLeafId: "entry-1",
+    activePathIds: ["entry-1"],
+  };
+
+  it("reads the branch structure alongside the transcript", async () => {
+    const commands: string[] = [];
+    const { controller, read } = treeRefreshHarness((text) => {
+      commands.push(text);
+      return Promise.resolve<CommandResult>({ type: "tree", tree });
+    });
+
+    await controller.selectSession(oldSession, { updateUrl: false });
+
+    expect(commands).toEqual(["/tree"]);
+    expect(read().sessionTree).toEqual(tree);
+  });
+
+  it("keeps the last snapshot when a refresh cannot read the tree", async () => {
+    // `/tree` declines while the session has work in flight, and older remotes do
+    // not serve it at all. Dropping the snapshot would make fork markers blink out.
+    let result: CommandResult = { type: "tree", tree };
+    const { controller, read } = treeRefreshHarness(() => Promise.resolve(result));
+
+    await controller.selectSession(oldSession, { updateUrl: false });
+    expect(read().sessionTree).toEqual(tree);
+
+    result = { type: "unsupported", message: "Cannot open the session tree while the session is active." };
+    await controller.refreshSelectedSession();
+
+    expect(read().sessionTree).toEqual(tree);
+  });
+});
 
 describe("SessionController selected-session refresh", () => {
   it("signals selection readiness only after the initial transcript join succeeds", async () => {
@@ -159,3 +196,25 @@ describe("SessionController selected-session refresh", () => {
     expect(snapshotLookups).toEqual([oldSession.id]);
   });
 });
+
+function treeRefreshHarness(runCommand: (text: string) => Promise<CommandResult>): { controller: SessionController; read: () => AppState } {
+  let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, sessions: [oldSession] };
+  const controller = new SessionController(
+    () => state,
+    (patch) => { state = { ...state, ...patch }; },
+    () => undefined,
+    undefined,
+    {
+      api: {
+        ...defaultApi,
+        messages: () => Promise.resolve(page("history", 1)),
+        status: () => Promise.resolve(status(oldSession.id)),
+        streamSnapshot: () => Promise.resolve({ seq: 0, partial: null }),
+        thinkingLevels: () => Promise.resolve({ levels: [] }),
+        runCommand: (_session, text) => runCommand(text),
+      },
+      socket: new FakeSocket(),
+    },
+  );
+  return { controller, read: () => state };
+}
