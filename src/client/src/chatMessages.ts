@@ -1,7 +1,31 @@
 import type { ChatLine, ChatPart, ToolExecutionPart, ToolPreview } from "./components/shared";
 
 export function normalizeMessages(messages: unknown[]): ChatLine[] {
-  return coalesceToolExecutions(messages.flatMap(normalizeMessage)).filter((message) => message.parts.length > 0);
+  const lines = coalesceToolExecutions(messages.flatMap(normalizeMessage)).filter((message) => message.parts.length > 0);
+  return withUniqueEntryIds(lines);
+}
+
+/**
+ * Keep `entryId` only where exactly one rendered line came from that entry.
+ * Normalization is not one-to-one: a skill invocation splits into two lines and
+ * an assistant message splits around its tool calls, and every resulting line
+ * would otherwise claim to *be* that entry. Since an entry-addressed action
+ * (session-tree navigation) can only mean one thing per entry, an ambiguous id
+ * is worse than no id: it would silently act on a different line than the one
+ * the user pointed at.
+ */
+function withUniqueEntryIds(lines: ChatLine[]): ChatLine[] {
+  const lineCounts = new Map<string, number>();
+  for (const line of lines) {
+    if (line.entryId !== undefined) lineCounts.set(line.entryId, (lineCounts.get(line.entryId) ?? 0) + 1);
+  }
+  return lines.map((line) => (line.entryId !== undefined && (lineCounts.get(line.entryId) ?? 0) > 1 ? withoutEntryId(line) : line));
+}
+
+function withoutEntryId(line: ChatLine): ChatLine {
+  const remaining = { ...line };
+  delete remaining.entryId;
+  return remaining;
 }
 
 export function textMessage(role: ChatLine["role"], text: string): ChatLine {
@@ -11,6 +35,13 @@ export function textMessage(role: ChatLine["role"], text: string): ChatLine {
 export function withMessageMeta(line: ChatLine, rawMessage: unknown): ChatLine {
   const meta = normalizeMeta(rawMessage);
   return meta === undefined ? line : { ...line, meta };
+}
+
+/** Carry over everything a rendered line inherits from its raw message: display metadata and the session entry it came from. */
+function fromRawMessage(line: ChatLine, rawMessage: unknown): ChatLine {
+  const entryId = getString(rawMessage, "entryId");
+  const withMeta = withMessageMeta(line, rawMessage);
+  return entryId === undefined || entryId === "" ? withMeta : { ...withMeta, entryId };
 }
 
 export function appendText(messages: ChatLine[], role: ChatLine["role"], text: string): ChatLine[] {
@@ -43,19 +74,19 @@ export function appendThinking(messages: ChatLine[], text: string): ChatLine[] {
 
 export function normalizeMessage(message: unknown): ChatLine[] {
   if (isChatLine(message)) return [message];
-  if (getString(message, "role") === "bashExecution") return [withMessageMeta(normalizeBashExecution(message), message)];
+  if (getString(message, "role") === "bashExecution") return [fromRawMessage(normalizeBashExecution(message), message)];
   const role = normalizeRole(getString(message, "role"));
   const parts = normalizeContent(getProperty(message, "content"), message);
   const skillLines = role === "user" ? normalizeSkillInvocation(parts) : undefined;
-  if (skillLines !== undefined) return skillLines.map((line) => withMessageMeta(line, message));
+  if (skillLines !== undefined) return skillLines.map((line) => fromRawMessage(line, message));
   const source = normalizeSource(message);
-  if (role === "tool") return [withMessageMeta({ role, parts, ...(source === undefined ? {} : { source }) }, message)];
+  if (role === "tool") return [fromRawMessage({ role, parts, ...(source === undefined ? {} : { source }) }, message)];
 
   const visible = parts.filter((part) => part.type !== "empty");
   const displayRole = role === "assistant" && visible.length > 0 && visible.every((part) => part.type === "skillRead") ? "skill" : role;
-  const lines = visible.length > 0 ? [withMessageMeta({ role: displayRole, parts: visible, ...(source === undefined ? {} : { source }) }, message)] : [];
+  const lines = visible.length > 0 ? [fromRawMessage({ role: displayRole, parts: visible, ...(source === undefined ? {} : { source }) }, message)] : [];
   const errorLine = assistantErrorLine(message);
-  return errorLine === undefined ? lines : [...lines, withMessageMeta(errorLine, message)];
+  return errorLine === undefined ? lines : [...lines, fromRawMessage(errorLine, message)];
 }
 
 function assistantErrorLine(message: unknown): ChatLine | undefined {
@@ -209,7 +240,9 @@ function coalesceToolExecutions(lines: ChatLine[]): ChatLine[] {
 
   for (const line of lines) {
     let passthroughParts: ChatPart[] = [];
-    const metadata = { ...(line.source === undefined ? {} : { source: line.source }), ...(line.meta === undefined ? {} : { meta: line.meta }) };
+    // Every line split out of `line` inherits its entry id here; `withUniqueEntryIds`
+    // then drops ids that ended up on more than one line.
+    const metadata = { ...(line.source === undefined ? {} : { source: line.source }), ...(line.meta === undefined ? {} : { meta: line.meta }), ...(line.entryId === undefined ? {} : { entryId: line.entryId }) };
     const flushPassthrough = () => {
       if (passthroughParts.length === 0) return;
       result.push({ role: line.role, parts: passthroughParts, ...metadata });
