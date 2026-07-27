@@ -7,7 +7,8 @@ import { writeClipboardText } from "../clipboard";
 import { capturePrependScrollAnchor, PREPEND_RESTORE_SETTLE_FRAMES, restorePrependScrollAnchor, type PrependScrollAnchor } from "../chatScrollAnchoring";
 import { shouldRequestEarlierMessages } from "../chatHistoryLoading";
 import { ChatScrollController, distanceFromScrollBottom, findFirstVisibleArticle, isNearScrollBottom, type ChatAnchorScrollPosition, type ChatScrollRestoreResult } from "../chatScrollPosition";
-import type { QueuedSessionMessage, SessionActivity, SessionStatus, SessionWarningSeverity } from "../api";
+import type { QueuedSessionMessage, SessionActivity, SessionStatus, SessionTreeSnapshot, SessionWarningSeverity } from "../api";
+import { buildSessionTreeModel, sessionTreeBranchPositions, type SessionTreeBranchPosition } from "../sessionTreeModel";
 import {
   notificationAnnouncementLabel,
   notificationDismissLabel,
@@ -155,6 +156,49 @@ export function chatEditFromHereAction(message: ChatLine, sessionLive: boolean):
   return { entryId: message.entryId, disabledReason: sessionLive ? "stop current activity first" : undefined };
 }
 
+/** One arrow of the branch switcher. A missing target renders it disabled. */
+export interface ChatBranchArrow {
+  readonly targetId: string | undefined;
+  readonly title: string;
+}
+
+/** The branch switcher shown on an entry a conversation forked at. */
+export interface ChatBranchSwitcher {
+  readonly label: string;
+  readonly older: ChatBranchArrow;
+  readonly newer: ChatBranchArrow;
+}
+
+/**
+ * The branch switcher for a transcript line, or `undefined` when the line is not
+ * at a fork. Alternatives are addressed by session entry, so a line that does not
+ * uniquely identify its entry cannot have one — the same rule that governs the
+ * rewind action.
+ */
+export function chatBranchSwitcher(
+  message: ChatLine,
+  positions: ReadonlyMap<string, SessionTreeBranchPosition>,
+  sessionLive: boolean,
+): ChatBranchSwitcher | undefined {
+  if (message.role !== "user" || message.entryId === undefined) return undefined;
+  const position = positions.get(message.entryId);
+  if (position === undefined) return undefined;
+  return {
+    label: `${String(position.index)}/${String(position.total)}`,
+    older: chatBranchArrow(position.index > 1, position.olderTargetId, sessionLive, "older"),
+    newer: chatBranchArrow(position.index < position.total, position.newerTargetId, sessionLive, "newer"),
+  };
+}
+
+function chatBranchArrow(exists: boolean, targetId: string | undefined, sessionLive: boolean, direction: "older" | "newer"): ChatBranchArrow {
+  if (!exists) return { targetId: undefined, title: `No ${direction} branch` };
+  // The branch exists but holds nothing pi can switch to: everything in it is
+  // still an unanswered message.
+  if (targetId === undefined) return { targetId: undefined, title: `The ${direction} branch has no reply yet` };
+  if (sessionLive) return { targetId: undefined, title: `Show the ${direction} branch — stop current activity first` };
+  return { targetId, title: `Show the ${direction} branch` };
+}
+
 /** A rendered session-warning row derived from live status warnings. */
 export interface ChatSessionWarningRow {
   severity: SessionWarningSeverity;
@@ -225,6 +269,10 @@ export class ChatView extends LitElement {
   @property({ attribute: false }) onLoadMore?: () => void;
   /** Rewind the session to just before `entryId` and refill the prompt editor. Absent when the session cannot be written to. */
   @property({ attribute: false }) onEditFromHere?: (entryId: string) => Promise<void>;
+  /** Branch structure behind this transcript, used to mark the entries a conversation forked at. */
+  @property({ attribute: false }) sessionTree?: SessionTreeSnapshot;
+  /** Show the branch reached by navigating to `targetId`. Absent when the session cannot be written to. */
+  @property({ attribute: false }) onShowBranch?: (targetId: string) => Promise<void>;
   @query(".chat") private chat?: HTMLDivElement;
   @query("dialog.image-zoom") private imageZoomDialog?: HTMLDialogElement;
   @state() private pinnedToBottom = true;
@@ -232,6 +280,9 @@ export class ChatView extends LitElement {
   @state() private expandedMetaKey: string | undefined;
   @state() private copiedMessageKey: string | undefined;
   @state() private editingFromEntryId: string | undefined;
+  @state() private switchingBranchTargetId: string | undefined;
+  private branchPositionsCache: ReadonlyMap<string, SessionTreeBranchPosition> = new Map();
+  private branchPositionsKey: SessionTreeSnapshot | undefined;
   @state() private currentConversationIndex: number | undefined;
   @state() private collapsedNotificationTargetKeys: ReadonlySet<string> = new Set();
   @state() private retainedEmptyNotificationTrayTargetKey: string | undefined;
@@ -805,6 +856,7 @@ export class ChatView extends LitElement {
       <div class="msg-header">
         <b class="label">${label}</b>
         <div class="msg-header-trailing">
+          ${this.renderBranchSwitcher(message)}
           ${this.renderMessageActions(message, key)}
           <span class=${expanded ? "msg-meta expanded" : "msg-meta"} role="button" tabindex="0" title=${meta} aria-label=${meta} aria-expanded=${String(expanded)} @click=${() => { this.expandedMetaKey = expanded ? undefined : key; }} @keydown=${(event: KeyboardEvent) => { this.onMetaKeydown(event, key, expanded); }}>${meta}</span>
         </div>
@@ -833,7 +885,7 @@ export class ChatView extends LitElement {
     // One rewind at a time: a second navigation would carry the leaf the first one
     // just invalidated, and the user would get a stale-session error instead of an
     // explanation.
-    const disabledReason = this.editingFromEntryId === undefined ? action.disabledReason : "already rewinding";
+    const disabledReason = this.isNavigatingTree() ? "already navigating" : action.disabledReason;
     return html`
       <button
         type="button"
@@ -843,9 +895,65 @@ export class ChatView extends LitElement {
         aria-label="Edit from here — rewind this session to before this message"
         @click=${(event: MouseEvent) => { void this.editFromHere(action.entryId, event); }}
       >
-        <span aria-hidden="true">↩</span>
+        <span aria-hidden="true">✎</span>
       </button>
     `;
+  }
+
+  private renderBranchSwitcher(message: ChatLine) {
+    if (this.onShowBranch === undefined) return null;
+    const switcher = chatBranchSwitcher(message, this.branchPositions(), this.isSessionLive());
+    if (switcher === undefined) return null;
+    const navigating = this.isNavigatingTree();
+    const older = navigating ? undefined : switcher.older.targetId;
+    const newer = navigating ? undefined : switcher.newer.targetId;
+    return html`
+      <div class="branch-switcher" role="group" aria-label=${`Conversation branch ${switcher.label}`}>
+        <button type="button" class="branch-arrow" ?disabled=${older === undefined} title=${switcher.older.title} aria-label="Show older branch" @click=${(event: MouseEvent) => { void this.showBranch(older, event); }}>
+          <span aria-hidden="true">‹</span>
+        </button>
+        <span class="branch-count">${switcher.label}</span>
+        <button type="button" class="branch-arrow" ?disabled=${newer === undefined} title=${switcher.newer.title} aria-label="Show newer branch" @click=${(event: MouseEvent) => { void this.showBranch(newer, event); }}>
+          <span aria-hidden="true">›</span>
+        </button>
+      </div>
+    `;
+  }
+
+  /**
+   * Branch positions for the current snapshot. Rebuilding the tree model per render
+   * would walk every entry in the session on every keystroke, so it is cached on
+   * the snapshot that produced it.
+   */
+  private branchPositions(): ReadonlyMap<string, SessionTreeBranchPosition> {
+    const tree = this.sessionTree;
+    if (tree === undefined) return new Map();
+    if (this.branchPositionsKey !== tree) {
+      this.branchPositionsCache = sessionTreeBranchPositions(buildSessionTreeModel(tree));
+      this.branchPositionsKey = tree;
+    }
+    return this.branchPositionsCache;
+  }
+
+  /**
+   * Both affordances move the same leaf. A second navigation would carry the leaf
+   * the first one is invalidating, so the user would get a stale-session error
+   * instead of the branch they asked for.
+   */
+  private isNavigatingTree(): boolean {
+    return this.editingFromEntryId !== undefined || this.switchingBranchTargetId !== undefined;
+  }
+
+  private async showBranch(targetId: string | undefined, event: MouseEvent): Promise<void> {
+    event.stopPropagation();
+    const showBranch = this.onShowBranch;
+    if (showBranch === undefined || targetId === undefined || this.isNavigatingTree()) return;
+    this.switchingBranchTargetId = targetId;
+    try {
+      await showBranch(targetId);
+    } finally {
+      this.switchingBranchTargetId = undefined;
+    }
   }
 
   private async editFromHere(entryId: string, event: MouseEvent): Promise<void> {

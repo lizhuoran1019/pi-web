@@ -1,6 +1,6 @@
 import type { TemplateResult } from "lit";
 import { describe, expect, it, vi } from "vitest";
-import type { QueuedSessionMessage, SessionStatus, SessionWarning } from "../api";
+import type { QueuedSessionMessage, SessionStatus, SessionTreeSnapshot, SessionWarning } from "../api";
 import {
   notificationTargetKey,
   notificationTrayIsCollapsed,
@@ -9,6 +9,7 @@ import {
 import type { ChatLine } from "./shared";
 import {
   ChatView,
+  chatBranchSwitcher,
   chatEditFromHereAction,
   chatEventAnchorKey,
   chatGroupAnchorKey,
@@ -398,6 +399,98 @@ describe("ChatView edit-from-here wiring", () => {
   });
 });
 
+describe("chatBranchSwitcher", () => {
+  const userLine = (entryId?: string): ChatLine => ({
+    role: "user",
+    parts: [{ type: "text", text: "first ask" }],
+    ...(entryId === undefined ? {} : { entryId }),
+  });
+  const positions = new Map([["entry-1", { index: 2, total: 3, olderTargetId: "reply-1", newerTargetId: "reply-3" }]]);
+
+  it("labels the shown branch and points each arrow at its neighbour", () => {
+    expect(chatBranchSwitcher(userLine("entry-1"), positions, false)).toEqual({
+      label: "2/3",
+      older: { targetId: "reply-1", title: "Show the older branch" },
+      newer: { targetId: "reply-3", title: "Show the newer branch" },
+    });
+  });
+
+  it("disables both arrows while the session has work in flight", () => {
+    const switcher = chatBranchSwitcher(userLine("entry-1"), positions, true);
+
+    expect(switcher?.older.targetId).toBeUndefined();
+    expect(switcher?.newer.targetId).toBeUndefined();
+    expect(switcher?.newer.title).toContain("stop current activity first");
+  });
+
+  it("distinguishes an end of the list from a branch with nothing to show yet", () => {
+    const ends = new Map([["entry-1", { index: 1, total: 2, olderTargetId: undefined, newerTargetId: undefined }]]);
+    const switcher = chatBranchSwitcher(userLine("entry-1"), ends, false);
+
+    expect(switcher?.older.title).toBe("No older branch");
+    expect(switcher?.newer.title).toBe("The newer branch has no reply yet");
+  });
+
+  it("offers nothing away from a fork, or when the line cannot be addressed", () => {
+    expect(chatBranchSwitcher(userLine("entry-9"), positions, false)).toBeUndefined();
+    expect(chatBranchSwitcher(userLine(), positions, false)).toBeUndefined();
+    expect(chatBranchSwitcher({ role: "assistant", parts: [{ type: "text", text: "answer" }], entryId: "entry-1" }, positions, false)).toBeUndefined();
+  });
+});
+
+describe("ChatView branch switcher wiring", () => {
+  // Escape hatch: same rationale as the rewind wiring below — the only observable
+  // effects are the injected callback and the one-at-a-time guard.
+  const tree: SessionTreeSnapshot = {
+    nodes: [
+      { id: "root", parentId: null, kind: "assistant", summary: "root" },
+      { id: "ask-1", parentId: "root", kind: "user", summary: "ask 1" },
+      { id: "reply-1", parentId: "ask-1", kind: "assistant", summary: "reply 1" },
+      { id: "ask-2", parentId: "root", kind: "user", summary: "ask 2" },
+      { id: "reply-2", parentId: "ask-2", kind: "assistant", summary: "reply 2" },
+    ],
+    activeLeafId: "reply-1",
+    activePathIds: ["root", "ask-1", "reply-1"],
+  };
+  const shownAsk: ChatLine = { role: "user", parts: [{ type: "text", text: "ask 1" }], entryId: "ask-1" };
+
+  function viewWithBranches(onShowBranch: (targetId: string) => Promise<void>): ChatView {
+    const view = new ChatView();
+    view.sessionTree = tree;
+    view.onShowBranch = onShowBranch;
+    return view;
+  }
+
+  it("shows the neighbouring branch by its own navigable entry", () => {
+    const onShowBranch = vi.fn<(targetId: string) => Promise<void>>(() => Promise.resolve());
+    const view = viewWithBranches(onShowBranch);
+
+    templateEventHandlerNearMarker(requireTemplate(renderBranchSwitcher(view, shownAsk)), 'aria-label="Show newer branch')(new Event("click"));
+
+    expect(onShowBranch).toHaveBeenCalledExactlyOnceWith("reply-2");
+  });
+
+  it("runs one navigation at a time", () => {
+    let settle = (): void => undefined;
+    const onShowBranch = vi.fn<(targetId: string) => Promise<void>>(() => new Promise<void>((resolve) => { settle = resolve; }));
+    const view = viewWithBranches(onShowBranch);
+
+    const activate = templateEventHandlerNearMarker(requireTemplate(renderBranchSwitcher(view, shownAsk)), 'aria-label="Show newer branch');
+    activate(new Event("click"));
+    activate(new Event("click"));
+
+    expect(onShowBranch).toHaveBeenCalledOnce();
+    settle();
+  });
+
+  it("omits the switcher when no navigation handler is wired", () => {
+    const view = new ChatView();
+    view.sessionTree = tree;
+
+    expect(renderBranchSwitcher(view, shownAsk)).toBeNull();
+  });
+});
+
 interface GroupBodyRenderCall {
   messages: ChatLine[];
   startIndex: number;
@@ -408,6 +501,7 @@ type RenderMessageGroup = (this: ChatView, messages: ChatLine[], startIndex: num
 type RenderMessageGroupBody = (this: ChatView, messages: ChatLine[], startIndex: number) => TemplateResult;
 type RenderWarnings = (this: ChatView) => TemplateResult | null;
 type RenderMessageActions = (this: ChatView, message: ChatLine, key: string) => TemplateResult | null;
+type RenderBranchSwitcher = (this: ChatView, message: ChatLine) => TemplateResult | null;
 type RenderNotificationTray = (this: ChatView) => TemplateResult | null;
 type FocusPendingNotificationTarget = (this: ChatView) => void;
 type TemplateEventHandler = (event: Event) => void;
@@ -428,6 +522,12 @@ function renderMessageActions(view: ChatView, message: ChatLine, key: string): T
   const method: unknown = Reflect.get(view, "renderMessageActions");
   if (!isRenderMessageActions(method)) throw new Error("ChatView.renderMessageActions is not callable");
   return method.call(view, message, key);
+}
+
+function renderBranchSwitcher(view: ChatView, message: ChatLine): TemplateResult | null {
+  const method: unknown = Reflect.get(view, "renderBranchSwitcher");
+  if (!isRenderBranchSwitcher(method)) throw new Error("ChatView.renderBranchSwitcher is not callable");
+  return method.call(view, message);
 }
 
 function requireTemplate(value: TemplateResult | null): TemplateResult {
@@ -478,6 +578,10 @@ function isRenderMessageGroupBody(value: unknown): value is RenderMessageGroupBo
 }
 
 function isRenderMessageActions(value: unknown): value is RenderMessageActions {
+  return typeof value === "function";
+}
+
+function isRenderBranchSwitcher(value: unknown): value is RenderBranchSwitcher {
   return typeof value === "function";
 }
 
