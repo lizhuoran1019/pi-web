@@ -161,6 +161,50 @@ describe("chat message normalization", () => {
     ]);
   });
 
+  it("carries the session entry id onto the line rendered from that entry", () => {
+    expect(normalizeMessages([
+      { role: "user", content: "hello", entryId: "entry-1" },
+      { role: "assistant", content: "hi", entryId: "entry-2" },
+    ])).toEqual([
+      { role: "user", parts: [{ type: "text", text: "hello" }], entryId: "entry-1" },
+      { role: "assistant", parts: [{ type: "text", text: "hi" }], entryId: "entry-2" },
+    ]);
+  });
+
+  it("drops an entry id that would end up on more than one line", () => {
+    // One entry, two rendered lines: an entry-addressed action could not tell
+    // which line the user meant, so neither line claims the entry.
+    expect(normalizeMessages([{
+      role: "user",
+      entryId: "skill-entry",
+      content: "<skill name=\"playwright\" location=\"/skills/playwright\">\nUse browser\n</skill>\n\nNow test the UI",
+    }])).toEqual([
+      { role: "user", parts: [{ type: "skillInvocation", name: "playwright", location: "/skills/playwright", content: "Use browser" }] },
+      textMessage("user", "Now test the UI"),
+    ]);
+
+    // Same reason for an assistant message split around its tool call.
+    expect(normalizeMessages([{
+      role: "assistant",
+      entryId: "mixed-entry",
+      content: [{ type: "text", text: "running it" }, { type: "toolCall", id: "bash-1", name: "bash", arguments: { command: "npm test" } }],
+    }])).toEqual([
+      { role: "assistant", parts: [{ type: "text", text: "running it" }] },
+      { role: "tool", parts: [{ type: "toolExecution", toolCallId: "bash-1", toolName: "bash", summary: "npm test", args: { command: "npm test" }, status: "pending" }] },
+    ]);
+  });
+
+  it("keeps the entry id when a message renders as a single line with metadata", () => {
+    expect(normalizeMessages([{
+      role: "user",
+      entryId: "entry-3",
+      timestamp: "2026-05-09T12:00:00.000Z",
+      content: [{ type: "text", text: "with meta" }],
+    }])).toEqual([
+      { role: "user", parts: [{ type: "text", text: "with meta" }], entryId: "entry-3", meta: { timestamp: "2026-05-09T12:00:00.000Z" } },
+    ]);
+  });
+
   it("formats bash execution records as bash chat lines", () => {
     expect(normalizeMessage({
       role: "bashExecution",

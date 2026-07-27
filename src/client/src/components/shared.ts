@@ -64,6 +64,14 @@ export type ChatPart =
 export interface ChatLine {
   role: "user" | "assistant" | "tool" | "system" | "bash" | "skill";
   parts: ChatPart[];
+  /**
+   * Session entry this line was rendered from, when the line is the entry's only
+   * rendering. Present on committed history from the server; absent on lines
+   * built from live stream events, and dropped when one entry renders as several
+   * lines (see `normalizeMessages`). Actions that address history by entry id
+   * (session-tree navigation) require it.
+   */
+  entryId?: string;
   source?: "compaction" | "branch_summary";
   meta?: {
     timestamp?: string;
