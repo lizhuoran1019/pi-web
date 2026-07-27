@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { initialAppState } from "../appState";
 import { machineSessionKey } from "../machineKeys";
-import { loadDraft } from "../promptDraftStorage";
+import { loadDraft, saveDraft } from "../promptDraftStorage";
 import type { CommandResult, SessionTreeSnapshot } from "../api";
 import { SessionController } from "./sessionController";
 import { InMemorySessionSelectionMemory } from "./sessionSelection";
@@ -145,6 +145,101 @@ describe("SessionController edit from here", () => {
     await controller.editFromHere("entry-user");
 
     expect(runCommand).not.toHaveBeenCalled();
+  });
+});
+
+describe("SessionController show branch", () => {
+  function branchHarness(overrides: Partial<typeof defaultApi> = {}) {
+    const replacePromptEditorText = vi.fn();
+    let state: AppState = {
+      ...initialAppState(),
+      selectedWorkspace: workspace,
+      selectedSession: oldSession,
+      sessions: [oldSession],
+      sessionTree: tree,
+    };
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      new InMemorySessionSelectionMemory(),
+      {
+        api: {
+          ...defaultApi,
+          navigateTree: () => Promise.resolve({ cancelled: false }),
+          messages: () => Promise.resolve(page("other branch")),
+          status: () => Promise.resolve(status(oldSession.id)),
+          streamSnapshot: () => Promise.resolve({ seq: 0, partial: null }),
+          thinkingLevels: () => Promise.resolve({ levels: [] }),
+          runCommand: () => Promise.resolve<CommandResult>({ type: "tree", tree }),
+          ...overrides,
+        },
+        socket: new FakeSocket(),
+        replacePromptEditorText,
+      },
+    );
+    return { controller, replacePromptEditorText, read: () => state };
+  }
+
+  it("navigates to the neighbouring branch's entry against the known leaf, without summarizing", async () => {
+    const navigationCalls: unknown[] = [];
+    const { controller, read } = branchHarness({
+      navigateTree: (session, request, machineId) => {
+        navigationCalls.push({ sessionId: sessionLookupId(session), request, machineId });
+        return Promise.resolve({ cancelled: false });
+      },
+    });
+
+    await controller.showBranch("entry-assistant");
+
+    expect(navigationCalls).toEqual([{
+      sessionId: oldSession.id,
+      request: { targetId: "entry-assistant", expectedLeafId: "entry-assistant", summary: { mode: "none" } },
+      machineId: "local",
+    }]);
+    // Pi puts the leaf on the target, so the next switch does not carry a leaf the
+    // server has already moved past.
+    expect(read().sessionTree?.activeLeafId).toBe("entry-assistant");
+  });
+
+  it("leaves a typed draft alone", async () => {
+    // Pi returns editor text only when the target was a message to re-edit;
+    // switching branches has nothing to hand back and must not clear the editor.
+    saveDraft(machineSessionKey("local", oldSession.id), "half-written thought");
+    const { controller, replacePromptEditorText } = branchHarness();
+
+    await controller.showBranch("entry-assistant");
+
+    expect(loadDraft(machineSessionKey("local", oldSession.id))).toBe("half-written thought");
+    expect(replacePromptEditorText).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a rejected navigation and keeps the known leaf", async () => {
+    const { controller, read } = branchHarness({
+      navigateTree: () => Promise.reject(new Error("The session changed since /tree was opened.")),
+    });
+
+    await controller.showBranch("entry-assistant");
+
+    expect(read().error).toContain("The session changed since /tree was opened.");
+    expect(read().sessionTree?.activeLeafId).toBe("entry-assistant");
+  });
+
+  it("does nothing for an archived session", async () => {
+    const navigateTree = vi.fn<typeof defaultApi.navigateTree>();
+    const archived = { ...oldSession, archived: true };
+    let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: archived, sessions: [archived], sessionTree: tree };
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      new InMemorySessionSelectionMemory(),
+      { api: { ...defaultApi, navigateTree }, socket: new FakeSocket() },
+    );
+
+    await controller.showBranch("entry-assistant");
+
+    expect(navigateTree).not.toHaveBeenCalled();
   });
 });
 

@@ -522,6 +522,29 @@ export class SessionController {
   }
 
   /**
+   * Show a neighbouring branch of the shown conversation. The target comes from the
+   * tree snapshot rather than the message itself, because pi would read a user
+   * message target as "re-edit this" and rewind instead of switching.
+   */
+  async showBranch(targetId: string): Promise<void> {
+    const state = this.getState();
+    const session = state.selectedSession;
+    if (session === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) return;
+    const tree = state.sessionTree;
+    try {
+      const result = await this.runTreeNavigation(session, { targetId, expectedLeafId: tree?.activeLeafId ?? null, summary: { mode: "none" } }, undefined);
+      // Pi puts the leaf exactly on a non-message target, so the shown branch is
+      // known before the background tree read lands. Recording it keeps the very
+      // next switch from carrying a leaf the server has already moved past, and
+      // `buildSessionTreeModel` re-derives the shown path from the leaf.
+      if (tree !== undefined && !result.cancelled && this.getState().sessionTree === tree) this.setState({ sessionTree: { ...tree, activeLeafId: targetId } });
+    } catch {
+      // runTreeNavigation already surfaced the failure in `state.error`.
+      return;
+    }
+  }
+
+  /**
    * Shared tail of every tree navigation: run the mutation, then hand pi's editor
    * text to the prompt editor and re-read the branch authoritatively. Both the
    * `/tree` dialog and the inline transcript entry go through here so the two
@@ -546,8 +569,11 @@ export class SessionController {
 
     if (result.cancelled) return result;
 
-    const editorText = result.editorText ?? "";
-    saveDraft(cacheKey, editorText);
+    // Pi returns editor text only when the target was a message to re-edit.
+    // Nothing to hand back means nothing to hand back: switching between branches
+    // must leave whatever the user has typed alone.
+    const editorText = result.editorText;
+    if (editorText !== undefined) saveDraft(cacheKey, editorText);
     this.transcripts.discard(cacheKey);
 
     // A user can reselect the same session while the request is in flight. Its
@@ -564,7 +590,7 @@ export class SessionController {
     if (!this.isSelectedSessionIdentity(session.id, machineId)) return result;
 
     try {
-      await this.replacePromptEditorText?.({ machineId, sessionId: session.id, text: editorText });
+      if (editorText !== undefined) await this.replacePromptEditorText?.({ machineId, sessionId: session.id, text: editorText });
     } catch (error) {
       if (this.isSelectedSessionIdentity(session.id, machineId)) this.setState({ error: String(error) });
       throw error;

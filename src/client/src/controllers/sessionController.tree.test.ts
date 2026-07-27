@@ -254,9 +254,13 @@ describe("SessionController session tree navigation", () => {
     expect(state.error).toContain("prompt editor replacement failed");
   });
 
-  it("explicitly clears the editor draft when navigating to a non-user entry", async () => {
+  it("leaves the editor draft alone when navigating to an entry pi returns no text for", async () => {
+    // Superseded rule: navigating to a non-user entry used to clear the draft. The
+    // branch switcher makes that navigation an ordinary browsing step — several
+    // clicks to compare forks — so discarding what the user typed each time is
+    // wrong. The real signal is whether pi handed text back to re-edit.
     const cacheKey = machineSessionKey("local", oldSession.id);
-    saveDraft(cacheKey, "stale editor text");
+    saveDraft(cacheKey, "half-written thought");
     let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession], treeDialog: tree };
     const replacePromptEditorText = vi.fn();
     const api: typeof defaultApi = {
@@ -277,8 +281,8 @@ describe("SessionController session tree navigation", () => {
 
     await controller.navigateTree("leaf-1", { mode: "none" });
 
-    expect(loadDraft(cacheKey)).toBe("");
-    expect(replacePromptEditorText).toHaveBeenCalledWith({ machineId: "local", sessionId: oldSession.id, text: "" });
+    expect(loadDraft(cacheKey)).toBe("half-written thought");
+    expect(replacePromptEditorText).not.toHaveBeenCalled();
   });
 
   it("retains the tree on cancellation and errors and exposes abort and close lifecycle methods", async () => {
