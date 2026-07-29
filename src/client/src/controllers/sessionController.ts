@@ -173,7 +173,7 @@ export class SessionController {
     // session must not cancel the in-flight upload indicator of the session
     // that is still sending; the per-session entry is cleared by send()'s
     // finally block when the request settles.
-    this.setState({ selectedSession: undefined, messages: [], messagePageStart: 0, messagePageEnd: 0, messagePageTotal: 0, isLoadingEarlierMessages: false, status: undefined, activity: undefined, pendingAsk: undefined, pendingDialogs: [], closedDialogs: [], availableThinkingLevels: [], treeDialog: undefined });
+    this.setState({ selectedSession: undefined, messages: [], messagePageStart: 0, messagePageEnd: 0, messagePageTotal: 0, isLoadingEarlierMessages: false, status: undefined, activity: undefined, pendingAsk: undefined, pendingDialogs: [], closedDialogs: [], availableThinkingLevels: [], treeDialog: undefined, sessionTree: undefined });
   }
 
   deselectSession(options?: { forgetRememberedSelection?: boolean | undefined; updateUrl?: boolean | undefined }) {
@@ -229,6 +229,7 @@ export class SessionController {
       ...cached,
       isLoadingEarlierMessages: false,
       ...(options?.preserveTreeDialog === true ? {} : { treeDialog: undefined }),
+      sessionTree: undefined,
       status: session.archived === true ? undefined : this.getState().sessionStatuses[session.id],
       activity: session.archived === true ? undefined : this.getState().sessionActivities[session.id],
       pendingAsk: session.archived === true ? undefined : this.selectedPendingAsk(this.getState().sessionStatuses[session.id], machineId),
@@ -1271,6 +1272,7 @@ export class SessionController {
       closedDialogs: [],
       availableThinkingLevels: [],
       treeDialog: undefined,
+      sessionTree: undefined,
       ...(activity === undefined ? {} : { sessionActivities: { ...state.sessionActivities, [session.id]: activity } }),
       error: "",
     });

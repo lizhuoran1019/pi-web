@@ -42,6 +42,63 @@ describe("SessionController session tree refresh", () => {
 
     expect(read().sessionTree).toEqual(tree);
   });
+
+  it("clears the snapshot when the selected session is cleared", async () => {
+    const { controller, read } = treeRefreshHarness(() => Promise.resolve({ type: "tree", tree }));
+    await controller.selectSession(oldSession, { updateUrl: false });
+
+    controller.deselectSession({ updateUrl: false });
+
+    expect(read().selectedSession).toBeUndefined();
+    expect(read().sessionTree).toBeUndefined();
+  });
+
+  it("does not expose or apply the previous session tree while a replacement tree is delayed", async () => {
+    const staleTree = deferred<CommandResult>();
+    const replacementTree = deferred<CommandResult>();
+    const nextTree: SessionTreeSnapshot = {
+      nodes: [{ id: "entry-2", parentId: null, kind: "user", summary: "replacement ask" }],
+      activeLeafId: "entry-2",
+      activePathIds: ["entry-2"],
+    };
+    let state: AppState = {
+      ...initialAppState(),
+      selectedWorkspace: workspace,
+      selectedSession: oldSession,
+      sessions: [oldSession, replacementSession],
+      sessionTree: tree,
+    };
+    const api: typeof defaultApi = {
+      ...defaultApi,
+      messages: (session) => Promise.resolve(page(sessionLookupId(session), 1)),
+      status: (session) => Promise.resolve(status(sessionLookupId(session))),
+      streamSnapshot: () => Promise.resolve({ seq: 0, partial: null }),
+      thinkingLevels: () => Promise.resolve({ levels: [] }),
+      runCommand: (session) => sessionLookupId(session) === oldSession.id ? staleTree.promise : replacementTree.promise,
+    };
+    const controller = new SessionController(
+      () => state,
+      (patch) => { state = { ...state, ...patch }; },
+      () => undefined,
+      undefined,
+      { api, socket: new FakeSocket() },
+    );
+
+    await controller.refreshSelectedSession();
+    await controller.selectSession(replacementSession, { updateUrl: false });
+
+    expect(state.selectedSession?.id).toBe(replacementSession.id);
+    expect(state.sessionTree).toBeUndefined();
+
+    staleTree.resolve({ type: "tree", tree });
+    await Promise.resolve();
+    expect(state.sessionTree).toBeUndefined();
+
+    replacementTree.resolve({ type: "tree", tree: nextTree });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(state.sessionTree).toEqual(nextTree);
+  });
 });
 
 describe("SessionController selected-session refresh", () => {

@@ -1,6 +1,6 @@
 import type { TemplateResult } from "lit";
 import { describe, expect, it, vi } from "vitest";
-import type { QueuedSessionMessage, SessionStatus, SessionTreeSnapshot, SessionWarning } from "../api";
+import type { QueuedSessionMessage, SessionStatus, SessionWarning } from "../api";
 import {
   notificationTargetKey,
   notificationTrayIsCollapsed,
@@ -358,47 +358,6 @@ describe("chatEditFromHereAction", () => {
   });
 });
 
-describe("ChatView edit-from-here wiring", () => {
-  // Escape hatch: these cases verify the rewind button's Lit event wiring, whose
-  // only observable effects are the injected callback and the one-at-a-time
-  // guard. Vitest runs with no DOM environment here, so handler extraction
-  // anchored to the button's stable aria-label is proportionate.
-  const marker = 'aria-label="Edit from here';
-  const userLine: ChatLine = { role: "user", parts: [{ type: "text", text: "first ask" }], entryId: "entry-1" };
-
-  it("rewinds to the entry the activated line came from", () => {
-    const view = new ChatView();
-    const onEditFromHere = vi.fn<(entryId: string) => Promise<void>>(() => Promise.resolve());
-    view.onEditFromHere = onEditFromHere;
-
-    templateEventHandlerNearMarker(requireTemplate(renderMessageActions(view, userLine, "m:0")), marker)(new Event("click"));
-
-    expect(onEditFromHere).toHaveBeenCalledExactlyOnceWith("entry-1");
-  });
-
-  it("runs one rewind at a time", () => {
-    const view = new ChatView();
-    let settle = (): void => undefined;
-    const onEditFromHere = vi.fn<(entryId: string) => Promise<void>>(() => new Promise<void>((resolve) => { settle = resolve; }));
-    view.onEditFromHere = onEditFromHere;
-
-    const activate = templateEventHandlerNearMarker(requireTemplate(renderMessageActions(view, userLine, "m:0")), marker);
-    activate(new Event("click"));
-    activate(new Event("click"));
-
-    // A second navigation would carry the leaf the first one is invalidating, so
-    // the user would get a stale-session error instead of a rewind.
-    expect(onEditFromHere).toHaveBeenCalledOnce();
-    settle();
-  });
-
-  it("omits the action entirely when no rewind handler is wired", () => {
-    const view = new ChatView();
-
-    expect(() => templateEventHandlerNearMarker(requireTemplate(renderMessageActions(view, userLine, "m:0")), marker)).toThrow();
-  });
-});
-
 describe("chatBranchSwitcher", () => {
   const userLine = (entryId?: string): ChatLine => ({
     role: "user",
@@ -438,59 +397,6 @@ describe("chatBranchSwitcher", () => {
   });
 });
 
-describe("ChatView branch switcher wiring", () => {
-  // Escape hatch: same rationale as the rewind wiring below — the only observable
-  // effects are the injected callback and the one-at-a-time guard.
-  const tree: SessionTreeSnapshot = {
-    nodes: [
-      { id: "root", parentId: null, kind: "assistant", summary: "root" },
-      { id: "ask-1", parentId: "root", kind: "user", summary: "ask 1" },
-      { id: "reply-1", parentId: "ask-1", kind: "assistant", summary: "reply 1" },
-      { id: "ask-2", parentId: "root", kind: "user", summary: "ask 2" },
-      { id: "reply-2", parentId: "ask-2", kind: "assistant", summary: "reply 2" },
-    ],
-    activeLeafId: "reply-1",
-    activePathIds: ["root", "ask-1", "reply-1"],
-  };
-  const shownAsk: ChatLine = { role: "user", parts: [{ type: "text", text: "ask 1" }], entryId: "ask-1" };
-
-  function viewWithBranches(onShowBranch: (targetId: string) => Promise<void>): ChatView {
-    const view = new ChatView();
-    view.sessionTree = tree;
-    view.onShowBranch = onShowBranch;
-    return view;
-  }
-
-  it("shows the neighbouring branch by its own navigable entry", () => {
-    const onShowBranch = vi.fn<(targetId: string) => Promise<void>>(() => Promise.resolve());
-    const view = viewWithBranches(onShowBranch);
-
-    templateEventHandlerNearMarker(requireTemplate(renderBranchSwitcher(view, shownAsk)), 'aria-label="Show newer branch')(new Event("click"));
-
-    expect(onShowBranch).toHaveBeenCalledExactlyOnceWith("reply-2");
-  });
-
-  it("runs one navigation at a time", () => {
-    let settle = (): void => undefined;
-    const onShowBranch = vi.fn<(targetId: string) => Promise<void>>(() => new Promise<void>((resolve) => { settle = resolve; }));
-    const view = viewWithBranches(onShowBranch);
-
-    const activate = templateEventHandlerNearMarker(requireTemplate(renderBranchSwitcher(view, shownAsk)), 'aria-label="Show newer branch');
-    activate(new Event("click"));
-    activate(new Event("click"));
-
-    expect(onShowBranch).toHaveBeenCalledOnce();
-    settle();
-  });
-
-  it("omits the switcher when no navigation handler is wired", () => {
-    const view = new ChatView();
-    view.sessionTree = tree;
-
-    expect(renderBranchSwitcher(view, shownAsk)).toBeNull();
-  });
-});
-
 interface GroupBodyRenderCall {
   messages: ChatLine[];
   startIndex: number;
@@ -500,8 +406,6 @@ type RenderQueuedMessages = (this: ChatView) => TemplateResult;
 type RenderMessageGroup = (this: ChatView, messages: ChatLine[], startIndex: number, endIndex: number, defaultOpen: boolean) => TemplateResult;
 type RenderMessageGroupBody = (this: ChatView, messages: ChatLine[], startIndex: number) => TemplateResult;
 type RenderWarnings = (this: ChatView) => TemplateResult | null;
-type RenderMessageActions = (this: ChatView, message: ChatLine, key: string) => TemplateResult | null;
-type RenderBranchSwitcher = (this: ChatView, message: ChatLine) => TemplateResult | null;
 type RenderNotificationTray = (this: ChatView) => TemplateResult | null;
 type FocusPendingNotificationTarget = (this: ChatView) => void;
 type TemplateEventHandler = (event: Event) => void;
@@ -516,23 +420,6 @@ function renderMessageGroup(view: ChatView, messages: ChatLine[], startIndex: nu
   const method: unknown = Reflect.get(view, "renderMessageGroup");
   if (!isRenderMessageGroup(method)) throw new Error("ChatView.renderMessageGroup is not callable");
   return method.call(view, messages, startIndex, endIndex, defaultOpen);
-}
-
-function renderMessageActions(view: ChatView, message: ChatLine, key: string): TemplateResult | null {
-  const method: unknown = Reflect.get(view, "renderMessageActions");
-  if (!isRenderMessageActions(method)) throw new Error("ChatView.renderMessageActions is not callable");
-  return method.call(view, message, key);
-}
-
-function renderBranchSwitcher(view: ChatView, message: ChatLine): TemplateResult | null {
-  const method: unknown = Reflect.get(view, "renderBranchSwitcher");
-  if (!isRenderBranchSwitcher(method)) throw new Error("ChatView.renderBranchSwitcher is not callable");
-  return method.call(view, message);
-}
-
-function requireTemplate(value: TemplateResult | null): TemplateResult {
-  if (value === null) throw new Error("Expected a rendered template");
-  return value;
 }
 
 function renderWarnings(view: ChatView): TemplateResult | null {
@@ -574,14 +461,6 @@ function isRenderMessageGroup(value: unknown): value is RenderMessageGroup {
 }
 
 function isRenderMessageGroupBody(value: unknown): value is RenderMessageGroupBody {
-  return typeof value === "function";
-}
-
-function isRenderMessageActions(value: unknown): value is RenderMessageActions {
-  return typeof value === "function";
-}
-
-function isRenderBranchSwitcher(value: unknown): value is RenderBranchSwitcher {
   return typeof value === "function";
 }
 
