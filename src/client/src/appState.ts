@@ -66,6 +66,13 @@ export interface AppState {
   treeDialog: SessionTreeSnapshot | undefined;
   /** Branch structure of the selected session, read alongside its transcript. Retained when a refresh cannot read it. */
   sessionTree: SessionTreeSnapshot | undefined;
+  /**
+   * The message the prompt editor is rewriting, when it is rewriting one. `key`
+   * is the machine/session the rewrite belongs to, so a record left over from
+   * another session is ignored rather than acted on. Mirrored in browser storage
+   * so it survives a reload alongside the draft text it explains.
+   */
+  promptEditTarget: { key: string; entryId: string; previousDraft: string } | undefined;
   modelDialog: { title: string; options: CommandOption[]; selectedValue?: string } | undefined;
   thinkingDialog: { title: string; options: CommandOption[]; selectedValue?: string } | undefined;
   themeDialog: { title: string; options: CommandOption[]; selectedValue?: string } | undefined;
@@ -115,6 +122,7 @@ export type WorkspaceScopedStateReset = Pick<AppState,
   | "selectedNotificationInbox"
   | "treeDialog"
   | "sessionTree"
+  | "promptEditTarget"
   | "fileTree"
   | "expandedDirs"
   | "selectedFilePath"
@@ -137,6 +145,7 @@ export function resetWorkspaceScopedState(): WorkspaceScopedStateReset {
     selectedNotificationInbox: undefined,
     treeDialog: undefined,
     sessionTree: undefined,
+    promptEditTarget: undefined,
     fileTree: [],
     expandedDirs: {},
     selectedFilePath: undefined,
@@ -191,6 +200,7 @@ export function initialAppState(): AppState {
     commandDialog: undefined,
     treeDialog: undefined,
     sessionTree: undefined,
+    promptEditTarget: undefined,
     modelDialog: undefined,
     thinkingDialog: undefined,
     themeDialog: undefined,

@@ -140,7 +140,7 @@ export function chatQueuedSectionShowsClearAction(section: QueuedMessageSection,
 
 /** The "edit from here" affordance for one transcript line. */
 export interface ChatEditFromHereAction {
-  /** Session entry to rewind to. */
+  /** Session entry the rewrite will replace. */
   entryId: string;
   /** Why the action is currently refused, or `undefined` when it can run. */
   disabledReason: string | undefined;
@@ -148,12 +148,15 @@ export interface ChatEditFromHereAction {
 
 /**
  * The "edit from here" action for a transcript line, or `undefined` when the line
- * offers none. Only a user message can be rewound to — pi resolves the new leaf
- * from the target entry's parent and hands that message's text back for editing —
- * and only a line that uniquely identifies its session entry can be addressed at
- * all, which is what excludes lines normalization split out of one entry. The
- * server refuses tree navigation while a session has work in flight, so a live
- * session yields a disabled action rather than a request that is bound to fail.
+ * offers none. Only a user message can be rewritten — pi resolves the new leaf
+ * from the target entry's parent and forks the conversation there — and only a
+ * line that uniquely identifies its session entry can be addressed at all, which
+ * is what excludes lines normalization split out of one entry.
+ *
+ * Arming a rewrite asks nothing of the server; the rewind it eventually performs
+ * does, and the server refuses tree navigation while a session has work in
+ * flight. The action is offered only on an idle session so the user cannot line
+ * up a rewrite that has nowhere to land when they press send.
  */
 export function chatEditFromHereAction(message: ChatLine, sessionLive: boolean): ChatEditFromHereAction | undefined {
   if (message.role !== "user" || message.entryId === undefined) return undefined;
@@ -279,8 +282,10 @@ export class ChatView extends LitElement {
   @property({ type: Boolean }) warningsVisible = true;
   @property({ attribute: false }) onToggleWarnings?: () => void;
   @property({ attribute: false }) onLoadMore?: () => void;
-  /** Rewind the session to just before `entryId` and refill the prompt editor. Absent when the session cannot be written to. */
-  @property({ attribute: false }) onEditFromHere?: (entryId: string) => Promise<void>;
+  /** Start rewriting the message at `entryId`, whose text is handed over with it. Absent when the session cannot be written to. */
+  @property({ attribute: false }) onBeginMessageEdit?: (entryId: string, text: string) => void;
+  /** Session entry the prompt editor is currently rewriting, when it is rewriting one. */
+  @property({ attribute: false }) editingEntryId?: string;
   /** Branch structure behind this transcript, used to mark the entries a conversation forked at. */
   @property({ attribute: false }) sessionTree?: SessionTreeSnapshot;
   /** Show the branch reached by navigating to `targetId`. Absent when the session cannot be written to. */
@@ -291,7 +296,6 @@ export class ChatView extends LitElement {
   @state() private zoomedImage: { src: string; alt: string } | undefined = undefined;
   @state() private expandedMetaKey: string | undefined;
   @state() private copiedMessageKey: string | undefined;
-  @state() private editingFromEntryId: string | undefined;
   @state() private switchingBranchTargetId: string | undefined;
   private branchPositionsCache: ReadonlyMap<string, SessionTreeBranchPosition> = new Map();
   private branchPositionsKey: SessionTreeSnapshot | undefined;
@@ -874,9 +878,13 @@ export class ChatView extends LitElement {
     const toolOnly = this.isToolExecutionOnlyMessage(message);
     const askUserRecordOnly = this.isAskUserRecordOnlyMessage(message);
     const shellClass = toolOnly ? "msg tool-execution-shell" : "msg ask-user-record-shell";
+    // Styling reads "everything after the rewrite target" off the DOM order of the
+    // transcript's own children, so this class is the only place that has to know
+    // where the abandoned part of the conversation begins.
+    const rewriting = message.entryId !== undefined && message.entryId === this.editingEntryId;
     return html`
       ${this.renderScrollMarker(this.messageScrollMarkerId(index))}
-      <article class=${toolOnly || askUserRecordOnly ? shellClass : `msg ${message.role}`} data-index=${index} data-scroll-anchor-id=${this.messageAnchorKey(index)}>
+      <article class=${toolOnly || askUserRecordOnly ? shellClass : `msg ${message.role}${rewriting ? " rewrite-target" : ""}`} data-index=${index} data-scroll-anchor-id=${this.messageAnchorKey(index)}>
         ${toolOnly || askUserRecordOnly ? null : this.renderMessageHeader(message, String(index))}
         ${message.parts.map((part) => this.renderPart(part, message))}
       </article>
@@ -960,7 +968,7 @@ export class ChatView extends LitElement {
 
   private renderMessageActions(message: ChatLine, key: string) {
     const copyable = this.isCopyableMessage(message);
-    const editFromHere = this.onEditFromHere === undefined ? undefined : chatEditFromHereAction(message, this.isSessionLive());
+    const editFromHere = this.onBeginMessageEdit === undefined ? undefined : chatEditFromHereAction(message, this.isSessionLive());
     if (!copyable && editFromHere === undefined) return null;
     const copied = this.copiedMessageKey === key;
     return html`
@@ -970,12 +978,18 @@ export class ChatView extends LitElement {
             <span aria-hidden="true">${copied ? "✓" : "⧉"}</span>
           </button>
         `}
-        ${editFromHere === undefined ? null : this.renderEditFromHereAction(editFromHere)}
+        ${editFromHere === undefined ? null : this.renderEditFromHereAction(message, editFromHere)}
       </div>
     `;
   }
 
-  private renderEditFromHereAction(action: ChatEditFromHereAction) {
+  private renderEditFromHereAction(message: ChatLine, action: ChatEditFromHereAction) {
+    // The button on the message already being rewritten reports that state and
+    // nothing else. Letting it act would give one control two plausible meanings —
+    // cancel, or reset the text back to the original — and the second one would
+    // silently discard edits the user has already made. Cancelling lives on the
+    // hint above the composer instead, where it can say what it does.
+    const rewriting = this.editingEntryId === action.entryId;
     // One rewind at a time: a second navigation would carry the leaf the first one
     // just invalidated, and the user would get a stale-session error instead of an
     // explanation.
@@ -984,10 +998,11 @@ export class ChatView extends LitElement {
       <button
         type="button"
         class="msg-action"
-        ?disabled=${disabledReason !== undefined}
-        title=${disabledReason === undefined ? "Edit from here" : `Edit from here — ${disabledReason}`}
-        aria-label="Edit from here — rewind this session to before this message"
-        @click=${(event: MouseEvent) => { void this.editFromHere(action.entryId, event); }}
+        aria-pressed=${rewriting ? "true" : "false"}
+        ?disabled=${rewriting || disabledReason !== undefined}
+        title=${rewriting ? "Rewriting this message" : disabledReason === undefined ? "Edit from here" : `Edit from here — ${disabledReason}`}
+        aria-label=${rewriting ? "Rewriting this message" : "Edit from here — rewrite this message and send it as a new branch"}
+        @click=${(event: MouseEvent) => { this.beginMessageEdit(message, action.entryId, event); }}
       >
         <span aria-hidden="true">✎</span>
       </button>
@@ -1030,12 +1045,12 @@ export class ChatView extends LitElement {
   }
 
   /**
-   * Both affordances move the same leaf. A second navigation would carry the leaf
-   * the first one is invalidating, so the user would get a stale-session error
-   * instead of the branch they asked for.
+   * Whether a branch switch is still in flight. A second navigation would carry
+   * the leaf the first one is invalidating, so the user would get a stale-session
+   * error instead of the branch they asked for.
    */
   private isNavigatingTree(): boolean {
-    return this.editingFromEntryId !== undefined || this.switchingBranchTargetId !== undefined;
+    return this.switchingBranchTargetId !== undefined;
   }
 
   private async showBranch(targetId: string | undefined, event: MouseEvent): Promise<void> {
@@ -1050,16 +1065,12 @@ export class ChatView extends LitElement {
     }
   }
 
-  private async editFromHere(entryId: string, event: MouseEvent): Promise<void> {
+  private beginMessageEdit(message: ChatLine, entryId: string, event: MouseEvent): void {
     event.stopPropagation();
-    const editFromHere = this.onEditFromHere;
-    if (editFromHere === undefined || this.editingFromEntryId !== undefined) return;
-    this.editingFromEntryId = entryId;
-    try {
-      await editFromHere(entryId);
-    } finally {
-      this.editingFromEntryId = undefined;
-    }
+    // The text comes from the line on screen, not from the server: pi only hands a
+    // message's text back as part of rewinding to it, and the whole point of
+    // arming a rewrite separately is that it must not move the session yet.
+    this.onBeginMessageEdit?.(entryId, this.messageCopyText(message));
   }
 
   private onMetaKeydown(event: KeyboardEvent, key: string, expanded: boolean) {

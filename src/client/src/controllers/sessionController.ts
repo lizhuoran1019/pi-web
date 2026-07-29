@@ -4,7 +4,7 @@ import { forgetCachedNewSession, isCachedNewSessionInfo, markCachedNewSessionInf
 import { textMessage } from "../chatMessages";
 import type { ChatLine } from "../components/shared";
 import { machineSessionKey } from "../machineKeys";
-import { clearDraft, moveDraft, saveDraft } from "../promptDraftStorage";
+import { clearDraft, clearEditTarget, loadDraft, loadEditTarget, moveDraft, saveDraft, saveEditTarget } from "../promptDraftStorage";
 import { clearAskDraft } from "../askDrafts";
 import { ChatTranscriptStore } from "../chatTranscriptStore";
 import { isShellInput } from "../inputModes";
@@ -173,7 +173,7 @@ export class SessionController {
     // session must not cancel the in-flight upload indicator of the session
     // that is still sending; the per-session entry is cleared by send()'s
     // finally block when the request settles.
-    this.setState({ selectedSession: undefined, messages: [], messagePageStart: 0, messagePageEnd: 0, messagePageTotal: 0, isLoadingEarlierMessages: false, status: undefined, activity: undefined, pendingAsk: undefined, pendingDialogs: [], closedDialogs: [], availableThinkingLevels: [], treeDialog: undefined, sessionTree: undefined });
+    this.setState({ selectedSession: undefined, messages: [], messagePageStart: 0, messagePageEnd: 0, messagePageTotal: 0, isLoadingEarlierMessages: false, status: undefined, activity: undefined, pendingAsk: undefined, pendingDialogs: [], closedDialogs: [], availableThinkingLevels: [], treeDialog: undefined, sessionTree: undefined, promptEditTarget: undefined });
   }
 
   deselectSession(options?: { forgetRememberedSelection?: boolean | undefined; updateUrl?: boolean | undefined }) {
@@ -230,6 +230,7 @@ export class SessionController {
       isLoadingEarlierMessages: false,
       ...(options?.preserveTreeDialog === true ? {} : { treeDialog: undefined }),
       sessionTree: undefined,
+      promptEditTarget: selectedPromptEditTarget(transcriptKey),
       status: session.archived === true ? undefined : this.getState().sessionStatuses[session.id],
       activity: session.archived === true ? undefined : this.getState().sessionActivities[session.id],
       pendingAsk: session.archived === true ? undefined : this.selectedPendingAsk(this.getState().sessionStatuses[session.id], machineId),
@@ -322,7 +323,74 @@ export class SessionController {
     // Capture the originating session/machine before any await so the request
     // and its sending indicator stay bound to the right session even if the
     // user navigates elsewhere mid-upload.
-    await this.deliverPromptToSession(session, text, streamingBehavior, attachments, delivery, selectedMachineId(this.getState()), { markSending: hasAttachments });
+    const machineId = selectedMachineId(this.getState());
+    // A slash command or shell line has already been routed away above: neither is
+    // a message, so neither consumes a rewrite the user has lined up.
+    const editTarget = this.activeMessageEdit(session, machineId);
+    if (editTarget !== undefined) {
+      await this.sendMessageRewrite(session, editTarget, text, streamingBehavior, attachments, delivery, machineId);
+      return;
+    }
+    await this.deliverPromptToSession(session, text, streamingBehavior, attachments, delivery, machineId, { markSending: hasAttachments });
+  }
+
+  /**
+   * Send a rewrite of an earlier message: fork the conversation at that message
+   * first, then deliver the text as the new branch's opening prompt. This is the
+   * first and only moment the rewrite touches the server.
+   *
+   * The composer emptied itself before handing the text over, so every failure
+   * path has to give it back. A refused rewind leaves the rewrite armed, because
+   * nothing moved and retrying is the right next step; a refused prompt does not,
+   * because the session has already forked and re-sending would correctly land on
+   * the new branch as an ordinary message.
+   */
+  private async sendMessageRewrite(
+    session: SessionInfo,
+    target: { key: string; entryId: string; previousDraft: string },
+    text: string,
+    streamingBehavior: "steer" | "followUp" | undefined,
+    attachments: PromptAttachment[] | undefined,
+    delivery: PromptAttachmentDelivery,
+    machineId: string,
+  ): Promise<void> {
+    // The rewind runs a command, a mutation and a full branch re-read before the
+    // prompt even goes out. The composer is already empty and nothing else reports
+    // that window, so the session's own sending indicator covers all of it.
+    this.markSendingPrompt(session.id, true);
+    try {
+      if (!(await this.rewindToEntry(target.entryId))) {
+        await this.restoreComposerText(session, machineId, text);
+        return;
+      }
+      clearEditTarget(target.key);
+      if (this.getState().promptEditTarget?.key === target.key) this.setState({ promptEditTarget: undefined });
+      // Reselecting elsewhere during the rewind means this prompt no longer has a
+      // place to go, but the text is still the user's; keep it as that session's draft.
+      const delivered = this.isSelectedSessionIdentity(session.id, machineId)
+        && await this.deliverPromptToSession(session, text, streamingBehavior, attachments, delivery, machineId, { markSending: false });
+      if (!delivered) await this.restoreComposerText(session, machineId, text);
+    } finally {
+      this.markSendingPrompt(session.id, false);
+    }
+  }
+
+  /** Put a send's text back where the composer can reach it, and into the composer when it is still on screen. */
+  private async restoreComposerText(session: SessionInfo, machineId: string, text: string): Promise<void> {
+    saveDraft(machineSessionKey(machineId, session.id), text);
+    await this.replaceComposerText(session, machineId, text);
+  }
+
+  /** Push text into the prompt editor, when the editor is still showing this session. */
+  private async replaceComposerText(session: SessionInfo, machineId: string, text: string): Promise<void> {
+    if (!this.isSelectedSessionIdentity(session.id, machineId)) return;
+    try {
+      await this.replacePromptEditorText?.({ machineId, sessionId: session.id, text });
+    } catch (error) {
+      // The draft is already saved, so the text is not lost. Reporting this must
+      // not overwrite a send failure that is already in `state.error`.
+      if (this.getState().error === "") this.setState({ error: String(error) });
+    }
   }
 
   private markSendingPrompt(sessionId: string, sending: boolean): void {
@@ -478,20 +546,71 @@ export class SessionController {
       throw new Error("The session tree navigator is no longer available");
     }
 
-    return this.runTreeNavigation(session, { targetId, expectedLeafId: tree.activeLeafId, summary }, tree);
+    return this.runTreeNavigation(session, { targetId, expectedLeafId: tree.activeLeafId, summary }, tree, { handBackEditorText: true });
   }
 
   /**
-   * Rewind the session to just before a user message so the next send starts a
-   * new branch there. Pi resolves the new leaf from the target entry's parent and
-   * hands back that message's text for re-editing; the abandoned branch stays in
-   * the session file. The leaf is read immediately before the mutation so the
-   * server's optimistic-concurrency check still guards this entry point.
+   * Start rewriting a message the user already sent: hand its text to the prompt
+   * editor and remember which entry the next send replaces.
+   *
+   * Nothing is asked of the server here. The rewind that actually forks the
+   * conversation happens at send time instead, so a user who opens a rewrite and
+   * changes their mind can cancel it and leave no trace — neither in the session
+   * file nor on the screens of other clients watching the same session.
    */
-  async editFromHere(entryId: string): Promise<void> {
+  async beginMessageEdit(entryId: string, text: string): Promise<void> {
     const state = this.getState();
     const session = state.selectedSession;
     if (session === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) return;
+    const machineId = selectedMachineId(state);
+    const key = machineSessionKey(machineId, session.id);
+    // Only the first message picked records the draft this rewrite displaced.
+    // Pointing at a second message mid-rewrite must not record the first one's
+    // text as "what the user was typing", or cancelling would restore that
+    // instead of the draft they actually had.
+    const previousDraft = state.promptEditTarget?.key === key ? state.promptEditTarget.previousDraft : loadDraft(key);
+    saveEditTarget(key, { entryId, previousDraft });
+    saveDraft(key, text);
+    this.setState({ promptEditTarget: { key, entryId, previousDraft } });
+    await this.replaceComposerText(session, machineId, text);
+  }
+
+  /**
+   * Abandon a rewrite. Because the rewrite never reached the server, this only has
+   * to undo what the browser did: the composer goes back to the draft the rewrite
+   * displaced, down to being empty again if that is what was there.
+   */
+  async cancelMessageEdit(): Promise<void> {
+    const state = this.getState();
+    const session = state.selectedSession;
+    if (session === undefined) return;
+    const machineId = selectedMachineId(state);
+    const target = this.activeMessageEdit(session, machineId);
+    if (target === undefined) return;
+    clearEditTarget(target.key);
+    saveDraft(target.key, target.previousDraft);
+    this.setState({ promptEditTarget: undefined });
+    await this.replaceComposerText(session, machineId, target.previousDraft);
+  }
+
+  /** The rewrite in progress for a session, ignoring a record left behind by another one. */
+  private activeMessageEdit(session: SessionInfo, machineId: string): AppState["promptEditTarget"] {
+    const target = this.getState().promptEditTarget;
+    if (target === undefined || isClientPendingStartSessionInfo(session) || session.archived === true) return undefined;
+    return target.key === machineSessionKey(machineId, session.id) ? target : undefined;
+  }
+
+  /**
+   * Rewind the session to just before a user message so the next send starts a new
+   * branch there. Pi resolves the new leaf from the target entry's parent; the
+   * abandoned branch stays in the session file. The leaf is read immediately
+   * before the mutation so the server's optimistic-concurrency check still guards
+   * this entry point. Returns whether the session actually moved.
+   */
+  private async rewindToEntry(entryId: string): Promise<boolean> {
+    const state = this.getState();
+    const session = state.selectedSession;
+    if (session === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) return false;
     const machineId = selectedMachineId(state);
     const selectionSeq = this.selectionSeq;
 
@@ -500,25 +619,29 @@ export class SessionController {
       const result = await this.api.runCommand(session, TREE_COMMAND, machineId);
       if (result.type !== "tree") {
         if (this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) this.setState({ error: treeUnavailableMessage(result) });
-        return;
+        return false;
       }
       tree = result.tree;
     } catch (error) {
       if (this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) this.setState({ error: String(error) });
-      return;
+      return false;
     }
 
-    if (!this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) return;
+    if (!this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) return false;
     if (!tree.nodes.some((node) => node.id === entryId)) {
       this.setState({ error: "That message is no longer part of this session's history." });
-      return;
+      return false;
     }
 
     try {
-      await this.runTreeNavigation(session, { targetId: entryId, expectedLeafId: tree.activeLeafId, summary: { mode: "none" } }, undefined);
+      // Pi hands a re-edited message's text back for the editor. This path already
+      // holds the text the user wants to send — theirs, possibly edited — so
+      // accepting pi's copy here would overwrite their edits with the original.
+      const result = await this.runTreeNavigation(session, { targetId: entryId, expectedLeafId: tree.activeLeafId, summary: { mode: "none" } }, undefined, { handBackEditorText: false });
+      return !result.cancelled;
     } catch {
       // runTreeNavigation already surfaced the failure in `state.error`.
-      return;
+      return false;
     }
   }
 
@@ -533,7 +656,7 @@ export class SessionController {
     if (session === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) return;
     const tree = state.sessionTree;
     try {
-      const result = await this.runTreeNavigation(session, { targetId, expectedLeafId: tree?.activeLeafId ?? null, summary: { mode: "none" } }, undefined);
+      const result = await this.runTreeNavigation(session, { targetId, expectedLeafId: tree?.activeLeafId ?? null, summary: { mode: "none" } }, undefined, { handBackEditorText: true });
       // Pi puts the leaf exactly on a non-message target, so the shown branch is
       // known before the background tree read lands. Recording it keeps the very
       // next switch from carrying a leaf the server has already moved past, and
@@ -550,12 +673,14 @@ export class SessionController {
    * text to the prompt editor and re-read the branch authoritatively. Both the
    * `/tree` dialog and the inline transcript entry go through here so the two
    * cannot drift apart. `openTree` is the snapshot to close afterwards, when the
-   * navigation came from the dialog.
+   * navigation came from the dialog. `handBackEditorText` is false for the caller
+   * that already owns the text the user is about to send.
    */
   private async runTreeNavigation(
     session: SessionInfo,
     request: SessionTreeNavigateRequest,
     openTree: SessionTreeSnapshot | undefined,
+    options: { handBackEditorText: boolean },
   ): Promise<SessionTreeNavigateResult> {
     const machineId = selectedMachineId(this.getState());
     const selectionSeq = this.selectionSeq;
@@ -573,7 +698,7 @@ export class SessionController {
     // Pi returns editor text only when the target was a message to re-edit.
     // Nothing to hand back means nothing to hand back: switching between branches
     // must leave whatever the user has typed alone.
-    const editorText = result.editorText;
+    const editorText = options.handBackEditorText ? result.editorText : undefined;
     if (editorText !== undefined) saveDraft(cacheKey, editorText);
     this.transcripts.discard(cacheKey);
 
@@ -1273,6 +1398,7 @@ export class SessionController {
       availableThinkingLevels: [],
       treeDialog: undefined,
       sessionTree: undefined,
+      promptEditTarget: undefined,
       ...(activity === undefined ? {} : { sessionActivities: { ...state.sessionActivities, [session.id]: activity } }),
       error: "",
     });
@@ -2043,6 +2169,16 @@ function isHighFrequencyTranscriptEvent(event: SessionUiEvent): boolean {
 /** Whether the transcript holds a user line that no entry id can address yet. */
 function hasUnidentifiedUserMessage(messages: readonly ChatLine[]): boolean {
   return messages.some((message) => message.role === "user" && message.entryId === undefined);
+}
+
+/**
+ * The rewrite the composer had in progress for a session, read back from browser
+ * storage and tagged with the session it belongs to so a later selection cannot
+ * mistake it for its own.
+ */
+function selectedPromptEditTarget(key: string): AppState["promptEditTarget"] {
+  const stored = loadEditTarget(key);
+  return stored === undefined ? undefined : { key, entryId: stored.entryId, previousDraft: stored.previousDraft };
 }
 
 /** Reuse the server's wording when it declines to open the session tree. */

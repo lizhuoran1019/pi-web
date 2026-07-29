@@ -5,8 +5,10 @@ import type { SessionTreeSnapshot } from "../api";
 import { ChatView } from "./ChatView";
 import type { ChatLine } from "./shared";
 
-const editLabel = "Edit from here — rewind this session to before this message";
+const editLabel = "Edit from here — rewrite this message and send it as a new branch";
+const rewritingLabel = "Rewriting this message";
 const shownAsk: ChatLine = { role: "user", parts: [{ type: "text", text: "ask 1" }], entryId: "ask-1" };
+const shownReply: ChatLine = { role: "assistant", parts: [{ type: "text", text: "reply 1" }], entryId: "reply-1" };
 const tree: SessionTreeSnapshot = {
   nodes: [
     { id: "root", parentId: null, kind: "assistant", summary: "root" },
@@ -25,30 +27,39 @@ afterEach(() => {
 });
 
 describe("ChatView edit-from-here wiring", () => {
-  it("rewinds to the entry the activated line came from", async () => {
-    const onEditFromHere = vi.fn<(entryId: string) => Promise<void>>(() => Promise.resolve());
-    const view = await renderView({ onEditFromHere });
+  it("hands over the entry and the text of the activated line", async () => {
+    const onBeginMessageEdit = vi.fn<(entryId: string, text: string) => void>();
+    const view = await renderView({ onBeginMessageEdit });
 
     requiredButton(view, editLabel).click();
 
-    expect(onEditFromHere).toHaveBeenCalledExactlyOnceWith("ask-1");
+    // The text travels with the entry id because nothing asks the server for it:
+    // arming a rewrite must not move the session.
+    expect(onBeginMessageEdit).toHaveBeenCalledExactlyOnceWith("ask-1", "ask 1");
   });
 
-  it("runs one rewind at a time", async () => {
-    let settle = (): void => undefined;
-    const onEditFromHere = vi.fn<(entryId: string) => Promise<void>>(() => new Promise<void>((resolve) => { settle = resolve; }));
-    const view = await renderView({ onEditFromHere });
-    const button = requiredButton(view, editLabel);
+  it("reports the message it is already rewriting instead of offering to act again", async () => {
+    const onBeginMessageEdit = vi.fn<(entryId: string, text: string) => void>();
+    const view = await renderView({ onBeginMessageEdit, editingEntryId: "ask-1" });
 
-    button.click();
-    button.click();
-
-    expect(onEditFromHere).toHaveBeenCalledOnce();
-    settle();
-    await Promise.resolve();
+    expect(findButton(view, editLabel)).toBeUndefined();
+    const button = requiredButton(view, rewritingLabel);
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute("aria-pressed")).toBe("true");
   });
 
-  it("omits the action entirely when no rewind handler is wired", async () => {
+  it("marks the rewritten line so the transcript below it can be shown as superseded", async () => {
+    const onBeginMessageEdit = vi.fn<(entryId: string, text: string) => void>();
+    const view = await renderView({ onBeginMessageEdit, editingEntryId: "ask-1", messages: [shownAsk, shownReply] });
+
+    // Styling reads "after the rewrite target" off DOM order, so the marker is on
+    // the target alone; the reply below carries nothing of its own.
+    const marked = [...(view.shadowRoot?.querySelectorAll(".rewrite-target") ?? [])];
+    expect(marked).toHaveLength(1);
+    expect(marked[0]?.getAttribute("data-index")).toBe("0");
+  });
+
+  it("omits the action entirely when no rewrite handler is wired", async () => {
     const view = await renderView();
 
     expect(findButton(view, editLabel)).toBeUndefined();
@@ -87,16 +98,19 @@ describe("ChatView branch switcher wiring", () => {
 });
 
 async function renderView(options: {
-  onEditFromHere?: (entryId: string) => Promise<void>;
+  onBeginMessageEdit?: (entryId: string, text: string) => void;
+  editingEntryId?: string;
+  messages?: ChatLine[];
   onShowBranch?: (targetId: string) => Promise<void>;
   sessionTree?: SessionTreeSnapshot;
 } = {}): Promise<ChatView> {
   const view = new ChatView();
   view.sessionId = "session-1";
-  view.messages = [shownAsk];
-  view.messageEnd = 1;
-  view.messageTotal = 1;
-  if (options.onEditFromHere !== undefined) view.onEditFromHere = options.onEditFromHere;
+  view.messages = options.messages ?? [shownAsk];
+  view.messageEnd = view.messages.length;
+  view.messageTotal = view.messages.length;
+  if (options.onBeginMessageEdit !== undefined) view.onBeginMessageEdit = options.onBeginMessageEdit;
+  if (options.editingEntryId !== undefined) view.editingEntryId = options.editingEntryId;
   if (options.onShowBranch !== undefined) view.onShowBranch = options.onShowBranch;
   if (options.sessionTree !== undefined) view.sessionTree = options.sessionTree;
   document.body.append(view);

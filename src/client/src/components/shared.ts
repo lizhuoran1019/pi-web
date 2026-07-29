@@ -449,6 +449,19 @@ export const chatStyles = css`
   .msg-action { display: inline-grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--pi-border); border-radius: 6px; background: var(--pi-surface); color: var(--pi-muted); padding: 0; font: 14px system-ui, sans-serif; line-height: 1; cursor: pointer; }
   .msg-action:hover:not(:disabled), .msg-action:focus:not(:disabled) { color: var(--pi-text); border-color: var(--pi-accent); }
   .msg-action:disabled { opacity: .5; cursor: not-allowed; }
+  .msg.rewrite-target { border-color: var(--pi-accent); box-shadow: 0 0 0 1px var(--pi-accent); }
+  /* The message being rewritten has to stay marked when the pointer is elsewhere,
+     so its action row does not hide itself the way every other one does. */
+  .msg.rewrite-target > .msg-header .msg-actions { opacity: 1; }
+  /* Its own rewrite button is disabled so it cannot mean two things at once, but
+     it reports a state rather than an unavailable action, so it keeps full
+     contrast instead of the faded look that says "you cannot do this". */
+  .msg-action[aria-pressed="true"]:disabled { opacity: 1; border-color: var(--pi-accent); background: var(--pi-selection-bg); color: var(--pi-accent); cursor: default; }
+  /* Everything below the message being rewritten moves to the abandoned branch
+     once the rewrite is sent. Marking only the target and receding its later
+     siblings keeps the boundary structural: nothing has to recompute where
+     "after" starts, so nothing can disagree about it. */
+  .chat > .rewrite-target ~ * { opacity: .45; }
   /* Recedes with the timestamp it sits next to: at rest both are background
      information about the message, not something to act on. */
   .branch-switcher { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 1px; opacity: .28; transition: opacity .12s ease; }
@@ -613,6 +626,12 @@ export const promptEditorStyles = css`
   .markdown-editor .cm-focused { outline: none; }
   .shell-mode textarea, .shell-mode .markdown-editor .cm-editor { border-color: var(--pi-success); box-shadow: 0 0 0 1px var(--pi-success-ring); }
   .mode-hint { position: absolute; right: 46px; bottom: 8px; max-width: calc(100% - 54px); border: 1px solid var(--pi-success-border); border-radius: 999px; background: var(--pi-success-surface); color: var(--pi-success); padding: 2px 8px; font-size: 12px; pointer-events: none; }
+  /* Takes a row of the footer grid above the editor instead of floating inside it
+     like .mode-hint, which is unclickable by design: this hint carries the only
+     visible way out of a rewrite, so it has to accept a pointer. */
+  .edit-hint { display: flex; align-items: center; gap: 8px; min-width: 0; box-sizing: border-box; border: 1px solid var(--pi-accent-border); border-radius: 8px; background: var(--pi-selection-bg); color: var(--pi-text-secondary); padding: 4px 5px 4px 10px; font-size: 12px; }
+  .edit-hint-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .edit-hint button { flex: 0 0 auto; padding: 3px 8px; font-size: 12px; }
   .attachments { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
   .attachment-chip { position: relative; width: 56px; height: 56px; border: 1px solid var(--pi-border); border-radius: 8px; overflow: hidden; background: var(--pi-bg); }
   .attachment-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
