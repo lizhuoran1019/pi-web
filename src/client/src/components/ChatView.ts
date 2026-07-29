@@ -29,6 +29,7 @@ import {
 import type { ChatLine, ChatPart } from "./shared";
 import { chatStyles, renderSessionWarningIcon } from "./shared";
 import "./AskUserCard";
+import "./MessageRewriteEditor";
 import "./ExtensionDialogCard";
 import type { ExtensionDialogAnswerCallback, ExtensionDialogCancelCallback, ExtensionDialogDismissCallback } from "./ExtensionDialogCard";
 import "./ConversationMeter";
@@ -282,10 +283,8 @@ export class ChatView extends LitElement {
   @property({ type: Boolean }) warningsVisible = true;
   @property({ attribute: false }) onToggleWarnings?: () => void;
   @property({ attribute: false }) onLoadMore?: () => void;
-  /** Start rewriting the message at `entryId`, whose text is handed over with it. Absent when the session cannot be written to. */
-  @property({ attribute: false }) onBeginMessageEdit?: (entryId: string, text: string) => void;
-  /** Session entry the prompt editor is currently rewriting, when it is rewriting one. */
-  @property({ attribute: false }) editingEntryId?: string;
+  /** Fork the session at `entryId` and send `text` as the new branch's opening prompt. Absent when the session cannot be written to. */
+  @property({ attribute: false }) onRewriteMessage?: (entryId: string, text: string) => Promise<void>;
   /** Branch structure behind this transcript, used to mark the entries a conversation forked at. */
   @property({ attribute: false }) sessionTree?: SessionTreeSnapshot;
   /** Show the branch reached by navigating to `targetId`. Absent when the session cannot be written to. */
@@ -297,6 +296,13 @@ export class ChatView extends LitElement {
   @state() private expandedMetaKey: string | undefined;
   @state() private copiedMessageKey: string | undefined;
   @state() private switchingBranchTargetId: string | undefined;
+  /**
+   * The entry whose message body is currently an inline rewrite editor. Purely
+   * view state: the draft itself lives in the editor, and both die together when
+   * the user cancels or navigates away — an unsent rewrite is a thought, not a
+   * record, so nothing outlives the box it is typed in.
+   */
+  @state() private rewritingEntryId: string | undefined;
   private branchPositionsCache: ReadonlyMap<string, SessionTreeBranchPosition> = new Map();
   private branchPositionsKey: SessionTreeSnapshot | undefined;
   @state() private currentConversationIndex: number | undefined;
@@ -881,12 +887,12 @@ export class ChatView extends LitElement {
     // Styling reads "everything after the rewrite target" off the DOM order of the
     // transcript's own children, so this class is the only place that has to know
     // where the abandoned part of the conversation begins.
-    const rewriting = message.entryId !== undefined && message.entryId === this.editingEntryId;
+    const rewriting = message.entryId !== undefined && message.entryId === this.rewritingEntryId;
     return html`
       ${this.renderScrollMarker(this.messageScrollMarkerId(index))}
       <article class=${toolOnly || askUserRecordOnly ? shellClass : `msg ${message.role}${rewriting ? " rewrite-target" : ""}`} data-index=${index} data-scroll-anchor-id=${this.messageAnchorKey(index)}>
         ${toolOnly || askUserRecordOnly ? null : this.renderMessageHeader(message, String(index))}
-        ${message.parts.map((part) => this.renderPart(part, message))}
+        ${rewriting ? this.renderRewriteEditor(message, index) : message.parts.map((part) => this.renderPart(part, message))}
       </article>
     `;
   }
@@ -968,7 +974,7 @@ export class ChatView extends LitElement {
 
   private renderMessageActions(message: ChatLine, key: string) {
     const copyable = this.isCopyableMessage(message);
-    const editFromHere = this.onBeginMessageEdit === undefined ? undefined : chatEditFromHereAction(message, this.isSessionLive());
+    const editFromHere = this.onRewriteMessage === undefined ? undefined : chatEditFromHereAction(message, this.isSessionLive());
     if (!copyable && editFromHere === undefined) return null;
     const copied = this.copiedMessageKey === key;
     return html`
@@ -978,22 +984,26 @@ export class ChatView extends LitElement {
             <span aria-hidden="true">${copied ? "✓" : "⧉"}</span>
           </button>
         `}
-        ${editFromHere === undefined ? null : this.renderEditFromHereAction(message, editFromHere)}
+        ${editFromHere === undefined ? null : this.renderEditFromHereAction(editFromHere)}
       </div>
     `;
   }
 
-  private renderEditFromHereAction(message: ChatLine, action: ChatEditFromHereAction) {
+  private renderEditFromHereAction(action: ChatEditFromHereAction) {
     // The button on the message already being rewritten reports that state and
     // nothing else. Letting it act would give one control two plausible meanings —
     // cancel, or reset the text back to the original — and the second one would
     // silently discard edits the user has already made. Cancelling lives on the
-    // hint above the composer instead, where it can say what it does.
-    const rewriting = this.editingEntryId === action.entryId;
-    // One rewind at a time: a second navigation would carry the leaf the first one
-    // just invalidated, and the user would get a stale-session error instead of an
-    // explanation.
-    const disabledReason = this.isNavigatingTree() ? "already navigating" : action.disabledReason;
+    // editor itself, where it can say what it does.
+    const rewriting = this.rewritingEntryId === action.entryId;
+    // One rewrite at a time keeps "what will move to the abandoned branch" a
+    // single boundary on screen, and one navigation at a time keeps a second
+    // request from carrying the leaf the first one just invalidated.
+    const disabledReason = this.rewritingEntryId !== undefined
+      ? "finish or cancel the current rewrite"
+      : this.isNavigatingTree()
+        ? "already navigating"
+        : action.disabledReason;
     return html`
       <button
         type="button"
@@ -1002,7 +1012,7 @@ export class ChatView extends LitElement {
         ?disabled=${rewriting || disabledReason !== undefined}
         title=${rewriting ? "Rewriting this message" : disabledReason === undefined ? "Edit from here" : `Edit from here — ${disabledReason}`}
         aria-label=${rewriting ? "Rewriting this message" : "Edit from here — rewrite this message and send it as a new branch"}
-        @click=${(event: MouseEvent) => { this.beginMessageEdit(message, action.entryId, event); }}
+        @click=${(event: MouseEvent) => { event.stopPropagation(); this.rewritingEntryId = action.entryId; }}
       >
         <span aria-hidden="true">✎</span>
       </button>
@@ -1013,9 +1023,9 @@ export class ChatView extends LitElement {
     if (this.onShowBranch === undefined) return null;
     const switcher = chatBranchSwitcher(message, this.branchPositions(), this.isSessionLive());
     if (switcher === undefined) return null;
-    const navigating = this.isNavigatingTree();
-    const older = navigating ? undefined : switcher.older.targetId;
-    const newer = navigating ? undefined : switcher.newer.targetId;
+    const blocked = this.isNavigatingTree() || this.rewritingEntryId !== undefined;
+    const older = blocked ? undefined : switcher.older.targetId;
+    const newer = blocked ? undefined : switcher.newer.targetId;
     return html`
       <div class="branch-switcher" role="group" aria-label=${`Conversation branch ${switcher.label}`}>
         <button type="button" class="branch-arrow" ?disabled=${older === undefined} title=${switcher.older.title} aria-label="Show older branch" @click=${(event: MouseEvent) => { void this.showBranch(older, event); }}>
@@ -1053,6 +1063,35 @@ export class ChatView extends LitElement {
     return this.switchingBranchTargetId !== undefined;
   }
 
+  private renderRewriteEditor(message: ChatLine, index: number) {
+    return html`
+      <message-rewrite-editor
+        .text=${this.messageCopyText(message)}
+        .hasUncarriedParts=${message.parts.some((part) => part.type !== "text")}
+        .onSubmit=${(text: string) => this.submitRewrite(message.entryId ?? "", text)}
+        .onCancel=${() => { this.cancelRewrite(index); }}
+      ></message-rewrite-editor>
+    `;
+  }
+
+  private async submitRewrite(entryId: string, text: string): Promise<void> {
+    const rewriteMessage = this.onRewriteMessage;
+    if (rewriteMessage === undefined || entryId === "") return;
+    // A rejection stays with the editor, which is still holding the text; only a
+    // rewrite that actually went out takes the editor with it.
+    await rewriteMessage(entryId, text);
+    if (this.rewritingEntryId === entryId) this.rewritingEntryId = undefined;
+  }
+
+  private cancelRewrite(index: number): void {
+    this.rewritingEntryId = undefined;
+    // Focus was inside the editor this just removed. Hand it back to the button
+    // that opened it, so a keyboard user is not dropped at the top of the page.
+    void this.updateComplete.then(() => {
+      this.shadowRoot?.querySelector<HTMLButtonElement>(`article[data-index="${String(index)}"] .msg-action[aria-pressed]`)?.focus();
+    });
+  }
+
   private async showBranch(targetId: string | undefined, event: MouseEvent): Promise<void> {
     event.stopPropagation();
     const showBranch = this.onShowBranch;
@@ -1063,14 +1102,6 @@ export class ChatView extends LitElement {
     } finally {
       this.switchingBranchTargetId = undefined;
     }
-  }
-
-  private beginMessageEdit(message: ChatLine, entryId: string, event: MouseEvent): void {
-    event.stopPropagation();
-    // The text comes from the line on screen, not from the server: pi only hands a
-    // message's text back as part of rewinding to it, and the whole point of
-    // arming a rewrite separately is that it must not move the session yet.
-    this.onBeginMessageEdit?.(entryId, this.messageCopyText(message));
   }
 
   private onMetaKeydown(event: KeyboardEvent, key: string, expanded: boolean) {

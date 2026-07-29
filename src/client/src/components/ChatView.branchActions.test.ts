@@ -6,9 +6,8 @@ import { ChatView } from "./ChatView";
 import type { ChatLine } from "./shared";
 
 const editLabel = "Edit from here — rewrite this message and send it as a new branch";
-const rewritingLabel = "Rewriting this message";
 const shownAsk: ChatLine = { role: "user", parts: [{ type: "text", text: "ask 1" }], entryId: "ask-1" };
-const shownReply: ChatLine = { role: "assistant", parts: [{ type: "text", text: "reply 1" }], entryId: "reply-1" };
+const secondAsk: ChatLine = { role: "user", parts: [{ type: "text", text: "ask 2" }], entryId: "ask-2" };
 const tree: SessionTreeSnapshot = {
   nodes: [
     { id: "root", parentId: null, kind: "assistant", summary: "root" },
@@ -27,36 +26,79 @@ afterEach(() => {
 });
 
 describe("ChatView edit-from-here wiring", () => {
-  it("hands over the entry and the text of the activated line", async () => {
-    const onBeginMessageEdit = vi.fn<(entryId: string, text: string) => void>();
-    const view = await renderView({ onBeginMessageEdit });
+  it("turns the message body into an inline editor holding the message's text", async () => {
+    const view = await renderView({ onRewriteMessage: vi.fn(() => Promise.resolve()) });
 
     requiredButton(view, editLabel).click();
+    await view.updateComplete;
 
-    // The text travels with the entry id because nothing asks the server for it:
-    // arming a rewrite must not move the session.
-    expect(onBeginMessageEdit).toHaveBeenCalledExactlyOnceWith("ask-1", "ask 1");
+    // The edit happens where its consequences are, not in the composer: the
+    // message keeps its header while its body becomes the editor.
+    const editor = requiredRewriteEditor(view);
+    expect(editor.text).toBe("ask 1");
+    expect(view.shadowRoot?.querySelectorAll(".rewrite-target")).toHaveLength(1);
   });
 
-  it("reports the message it is already rewriting instead of offering to act again", async () => {
-    const onBeginMessageEdit = vi.fn<(entryId: string, text: string) => void>();
-    const view = await renderView({ onBeginMessageEdit, editingEntryId: "ask-1" });
+  it("submits the rewrite through the handler and closes the editor when it lands", async () => {
+    const onRewriteMessage = vi.fn<(entryId: string, text: string) => Promise<void>>(() => Promise.resolve());
+    const view = await renderView({ onRewriteMessage });
 
-    expect(findButton(view, editLabel)).toBeUndefined();
-    const button = requiredButton(view, rewritingLabel);
-    expect(button.disabled).toBe(true);
-    expect(button.getAttribute("aria-pressed")).toBe("true");
+    requiredButton(view, editLabel).click();
+    await view.updateComplete;
+    await requiredRewriteEditor(view).onSubmit?.("edited prompt");
+    await view.updateComplete;
+
+    expect(onRewriteMessage).toHaveBeenCalledExactlyOnceWith("ask-1", "edited prompt");
+    expect(view.shadowRoot?.querySelector("message-rewrite-editor")).toBeNull();
   });
 
-  it("marks the rewritten line so the transcript below it can be shown as superseded", async () => {
-    const onBeginMessageEdit = vi.fn<(entryId: string, text: string) => void>();
-    const view = await renderView({ onBeginMessageEdit, editingEntryId: "ask-1", messages: [shownAsk, shownReply] });
+  it("keeps the editor open when the rewrite is refused", async () => {
+    const onRewriteMessage = vi.fn<(entryId: string, text: string) => Promise<void>>(() => Promise.reject(new Error("refused")));
+    const view = await renderView({ onRewriteMessage });
 
-    // Styling reads "after the rewrite target" off DOM order, so the marker is on
-    // the target alone; the reply below carries nothing of its own.
-    const marked = [...(view.shadowRoot?.querySelectorAll(".rewrite-target") ?? [])];
-    expect(marked).toHaveLength(1);
-    expect(marked[0]?.getAttribute("data-index")).toBe("0");
+    requiredButton(view, editLabel).click();
+    await view.updateComplete;
+    await expect(requiredRewriteEditor(view).onSubmit?.("edited prompt")).rejects.toThrow("refused");
+    await view.updateComplete;
+
+    // The refusal belongs to the editor still holding the text; the transcript
+    // must not take the editor away from under it.
+    expect(view.shadowRoot?.querySelector("message-rewrite-editor")).not.toBeNull();
+  });
+
+  it("returns the message body and disables nothing once the rewrite is cancelled", async () => {
+    const view = await renderView({ onRewriteMessage: vi.fn(() => Promise.resolve()) });
+
+    requiredButton(view, editLabel).click();
+    await view.updateComplete;
+    requiredRewriteEditor(view).onCancel?.();
+    await view.updateComplete;
+
+    expect(view.shadowRoot?.querySelector("message-rewrite-editor")).toBeNull();
+    expect(view.shadowRoot?.querySelector(".rewrite-target")).toBeNull();
+    expect(requiredButton(view, editLabel).disabled).toBe(false);
+  });
+
+  it("holds other rewrites and branch switches while one rewrite is open", async () => {
+    const view = await renderView({
+      onRewriteMessage: vi.fn(() => Promise.resolve()),
+      onShowBranch: vi.fn(() => Promise.resolve()),
+      sessionTree: tree,
+      messages: [shownAsk, secondAsk],
+    });
+
+    requiredButton(view, editLabel).click();
+    await view.updateComplete;
+
+    // One rewrite at a time keeps "what will move to the abandoned branch" a
+    // single boundary; a branch switch would unmount the editor with the user's
+    // unsent text still in it.
+    const editButtons = findButtons(view, editLabel);
+    expect(editButtons).toHaveLength(1);
+    expect(editButtons[0]?.disabled).toBe(true);
+    expect(editButtons[0]?.title).toContain("finish or cancel the current rewrite");
+    expect(requiredButton(view, "Rewriting this message").getAttribute("aria-pressed")).toBe("true");
+    expect(requiredButton(view, "Show newer branch").disabled).toBe(true);
   });
 
   it("omits the action entirely when no rewrite handler is wired", async () => {
@@ -98,8 +140,7 @@ describe("ChatView branch switcher wiring", () => {
 });
 
 async function renderView(options: {
-  onBeginMessageEdit?: (entryId: string, text: string) => void;
-  editingEntryId?: string;
+  onRewriteMessage?: (entryId: string, text: string) => Promise<void>;
   messages?: ChatLine[];
   onShowBranch?: (targetId: string) => Promise<void>;
   sessionTree?: SessionTreeSnapshot;
@@ -109,8 +150,7 @@ async function renderView(options: {
   view.messages = options.messages ?? [shownAsk];
   view.messageEnd = view.messages.length;
   view.messageTotal = view.messages.length;
-  if (options.onBeginMessageEdit !== undefined) view.onBeginMessageEdit = options.onBeginMessageEdit;
-  if (options.editingEntryId !== undefined) view.editingEntryId = options.editingEntryId;
+  if (options.onRewriteMessage !== undefined) view.onRewriteMessage = options.onRewriteMessage;
   if (options.onShowBranch !== undefined) view.onShowBranch = options.onShowBranch;
   if (options.sessionTree !== undefined) view.sessionTree = options.sessionTree;
   document.body.append(view);
@@ -119,8 +159,18 @@ async function renderView(options: {
 }
 
 function findButton(view: ChatView, label: string): HTMLButtonElement | undefined {
+  return findButtons(view, label)[0];
+}
+
+function findButtons(view: ChatView, label: string): HTMLButtonElement[] {
   return [...(view.shadowRoot?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
-    .find((button) => button.getAttribute("aria-label") === label);
+    .filter((button) => button.getAttribute("aria-label") === label);
+}
+
+function requiredRewriteEditor(view: ChatView) {
+  const editor = view.shadowRoot?.querySelector("message-rewrite-editor");
+  if (editor === null || editor === undefined) throw new Error("Expected an inline rewrite editor");
+  return editor;
 }
 
 function requiredButton(view: ChatView, label: string): HTMLButtonElement {

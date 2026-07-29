@@ -4,6 +4,7 @@ import {
   parsePromptEnterPreference,
   PROMPT_ENTER_PREFERENCE_STORAGE_KEY,
   readPromptEnterPreference,
+  resolvePromptEnterAction,
   shouldSendPromptOnEnter,
   shouldSendPromptOnEnterShortcut,
   shouldUsePromptEnterShiftShortcut,
@@ -26,6 +27,20 @@ describe("promptEnterBehavior", () => {
     expect(shouldSendPromptOnEnter({ matches: true } satisfies PromptEnterMedia, "send")).toBe(true);
     expect(shouldSendPromptOnEnter({ matches: false } satisfies PromptEnterMedia, "newline")).toBe(false);
     expect(shouldSendPromptOnEnter(undefined, "newline")).toBe(false);
+  });
+
+  it("resolves one Enter keypress the same way on both editing surfaces", () => {
+    // Desktop, auto: Enter sends, Shift+Enter breaks the line.
+    expect(resolvePromptEnterAction(false, false, { matches: false } satisfies PromptEnterMedia, "auto")).toBe("send");
+    expect(resolvePromptEnterAction(true, true, { matches: false } satisfies PromptEnterMedia, "auto")).toBe("newline");
+    // Mobile, auto: Enter breaks the line — and a Shift the surface never saw a
+    // keydown for is autocapitalization, not a request to send.
+    expect(resolvePromptEnterAction(false, false, { matches: true } satisfies PromptEnterMedia, "auto")).toBe("newline");
+    expect(resolvePromptEnterAction(true, false, { matches: true } satisfies PromptEnterMedia, "auto")).toBe("newline");
+    expect(resolvePromptEnterAction(true, true, { matches: true } satisfies PromptEnterMedia, "auto")).toBe("send");
+    // Explicit preferences override the environment either way.
+    expect(resolvePromptEnterAction(false, false, { matches: true } satisfies PromptEnterMedia, "send")).toBe("send");
+    expect(resolvePromptEnterAction(false, false, { matches: false } satisfies PromptEnterMedia, "newline")).toBe("newline");
   });
 
   it("swaps Shift+Enter with the plain Enter behavior", () => {

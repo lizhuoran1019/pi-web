@@ -37,10 +37,6 @@ export class PromptEditor extends LitElement {
   @property({ type: Boolean }) sending = false;
   @property({ attribute: false }) onSend?: (text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery?: PromptAttachmentDelivery) => void | Promise<void>;
   @property({ attribute: false }) onStop?: () => void;
-  /** Set while the composer holds a rewrite of an earlier message, which sending forks the conversation at. */
-  @property({ type: Boolean }) editingMessage = false;
-  /** Abandon that rewrite and restore whatever the composer held before it. */
-  @property({ attribute: false }) onCancelEdit?: () => void;
   @property({ attribute: false }) onSelectModel?: () => void;
   @property({ attribute: false }) onSelectThinking?: () => void;
   @property({ attribute: false }) availableThinkingLevels: readonly string[] = [];
@@ -113,7 +109,6 @@ export class PromptEditor extends LitElement {
     const busy = this.disabled || this.sending;
     return html`
       <footer class=${shellMode ? "shell-mode" : ""} @paste=${(event: ClipboardEvent) => { void this.handlePaste(event); }} @dragover=${(event: DragEvent) => { this.handleDragOver(event); }} @drop=${(event: DragEvent) => { void this.handleDrop(event); }}>
-        ${this.renderEditHint()}
         <div class="editor-wrap">
           <div class=${`markdown-editor${this.disabled ? " markdown-editor-disabled" : ""}`} aria-label="Message pi" aria-disabled=${this.disabled ? "true" : "false"}></div>
           <input class="attachment-input" type="file" multiple hidden @change=${(event: Event) => { void this.handleFileInput(event); }} />
@@ -130,21 +125,6 @@ export class PromptEditor extends LitElement {
           <button class="icon-button stop-button" ?disabled=${this.disabled || !this.canStop} title=${this.canStop ? "Stop current work and clear queued messages" : "Nothing running"} aria-label="Stop current work" @click=${() => this.onStop?.()}>${renderStopIcon()}</button>
         </div>
       </footer>
-    `;
-  }
-
-  /**
-   * States what sending will do, and offers the way out. A rewrite is invisible
-   * otherwise: the composer just holds text, and the conversation it is about to
-   * fork is still on screen in full.
-   */
-  private renderEditHint() {
-    if (!this.editingMessage) return null;
-    return html`
-      <div class="edit-hint" role="status">
-        <span class="edit-hint-text">Rewriting an earlier message — sending forks the conversation there</span>
-        <button type="button" title="Cancel the rewrite and restore your draft (Esc)" @click=${() => { this.cancelEdit(); }}>Cancel</button>
-      </div>
     `;
   }
 
@@ -313,7 +293,7 @@ export class PromptEditor extends LitElement {
             { any: (view, event) => this.handleEditorKeyDown(event, view) },
             { key: "ArrowDown", run: () => this.moveCompletion(1) },
             { key: "ArrowUp", run: () => this.moveCompletion(-1) },
-            { key: "Escape", run: () => this.closeCompletions() || this.cancelEdit() },
+            { key: "Escape", run: () => this.closeCompletions() },
             { key: "Tab", run: (view) => this.handleEditorTab(view) },
             { key: "Shift-Tab", run: (view) => indentWithTab.shift?.(view) ?? false },
             { key: "Backspace", run: (view) => deleteMarkupBackward(view) },
@@ -408,13 +388,6 @@ export class PromptEditor extends LitElement {
   private closeCompletions(): boolean {
     if (!this.completions.length) return false;
     this.completions = [];
-    return true;
-  }
-
-  /** Escape's second job, once there is no completion menu left for it to close. */
-  private cancelEdit(): boolean {
-    if (!this.editingMessage || this.onCancelEdit === undefined) return false;
-    this.onCancelEdit();
     return true;
   }
 

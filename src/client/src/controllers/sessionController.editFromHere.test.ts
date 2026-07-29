@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { initialAppState } from "../appState";
 import { machineSessionKey } from "../machineKeys";
-import { loadDraft, saveDraft, saveEditTarget } from "../promptDraftStorage";
+import { loadDraft, saveDraft } from "../promptDraftStorage";
 import type { CommandResult, SessionTreeSnapshot } from "../api";
 import { SessionController } from "./sessionController";
 import { InMemorySessionSelectionMemory } from "./sessionSelection";
@@ -34,14 +34,11 @@ beforeEach(() => {
   Object.defineProperty(globalThis, "localStorage", { value: new MemoryStorage(), configurable: true });
 });
 
-describe("SessionController edit from here", () => {
-  const key = machineSessionKey("local", oldSession.id);
-
-  function editHarness(overrides: Partial<typeof defaultApi> = {}) {
-    const replacePromptEditorText = vi.fn();
-    // One ordered log across every endpoint: the whole point of this design is
-    // that the fork happens between the user pressing send and the prompt going
-    // out, and only the order proves it.
+describe("SessionController message rewrite", () => {
+  function rewriteHarness(overrides: Partial<typeof defaultApi> = {}) {
+    // One ordered log across every endpoint: the design under test is that the
+    // fork happens between the inline editor's Re-ask and the prompt going out,
+    // and only the order proves it.
     const calls: string[] = [];
     const navigations: unknown[] = [];
     const prompts: unknown[] = [];
@@ -56,8 +53,7 @@ describe("SessionController edit from here", () => {
           ...defaultApi,
           runCommand: (session, text) => {
             calls.push(text);
-            if (text === TREE_COMMAND) return Promise.resolve<CommandResult>({ type: "tree", tree });
-            return Promise.resolve<CommandResult>({ type: "done" });
+            return Promise.resolve<CommandResult>({ type: "tree", tree });
           },
           navigateTree: (session, request, machineId) => {
             calls.push("navigate");
@@ -76,72 +72,19 @@ describe("SessionController edit from here", () => {
           ...overrides,
         },
         socket: new FakeSocket(),
-        replacePromptEditorText,
       },
     );
-    return { controller, replacePromptEditorText, calls, navigations, prompts, read: () => state };
+    return { controller, calls, navigations, prompts, read: () => state };
   }
 
-  it("arms a rewrite without asking anything of the session", async () => {
-    saveDraft(key, "half-written thought");
-    const { controller, calls, replacePromptEditorText, read } = editHarness();
-
-    await controller.beginMessageEdit("entry-user", "original prompt");
-
-    // Nothing reached the server, so there is nothing for a change of mind to undo.
-    expect(calls).toEqual([]);
-    expect(loadDraft(key)).toBe("original prompt");
-    expect(replacePromptEditorText).toHaveBeenCalledWith({ machineId: "local", sessionId: oldSession.id, text: "original prompt" });
-    expect(read().promptEditTarget).toEqual({ key, entryId: "entry-user", previousDraft: "half-written thought" });
-  });
-
-  it("restores the draft the rewrite displaced when it is abandoned", async () => {
-    saveDraft(key, "half-written thought");
-    const { controller, calls, replacePromptEditorText, read } = editHarness();
-
-    await controller.beginMessageEdit("entry-user", "original prompt");
-    await controller.cancelMessageEdit();
-
-    expect(loadDraft(key)).toBe("half-written thought");
-    expect(replacePromptEditorText).toHaveBeenLastCalledWith({ machineId: "local", sessionId: oldSession.id, text: "half-written thought" });
-    expect(read().promptEditTarget).toBeUndefined();
-    expect(calls).toEqual([]);
-  });
-
-  it("restores an empty composer just as faithfully", async () => {
-    const { controller, replacePromptEditorText } = editHarness();
-
-    await controller.beginMessageEdit("entry-user", "original prompt");
-    await controller.cancelMessageEdit();
-
-    expect(loadDraft(key)).toBe("");
-    expect(replacePromptEditorText).toHaveBeenLastCalledWith({ machineId: "local", sessionId: oldSession.id, text: "" });
-  });
-
-  it("keeps the originally displaced draft when a second message is picked", async () => {
-    saveDraft(key, "half-written thought");
-    const { controller, read } = editHarness();
-
-    await controller.beginMessageEdit("entry-user", "original prompt");
-    await controller.beginMessageEdit("entry-assistant", "second prompt");
-
-    // Recording the first message's text as "what the user was typing" would make
-    // cancelling restore that instead of their own draft.
-    expect(read().promptEditTarget).toEqual({ key, entryId: "entry-assistant", previousDraft: "half-written thought" });
-    await controller.cancelMessageEdit();
-    expect(loadDraft(key)).toBe("half-written thought");
-  });
-
   it("rewinds to the message's own entry before sending the rewrite, without summarizing", async () => {
-    const { controller, calls, navigations, prompts, replacePromptEditorText, read } = editHarness();
-    await controller.beginMessageEdit("entry-user", "original prompt");
-    replacePromptEditorText.mockClear();
+    const { controller, calls, navigations, prompts, read } = rewriteHarness();
 
-    await controller.send("edited prompt");
+    await controller.rewriteMessage("entry-user", "edited prompt");
 
     // Leaf read, then the fork, then the prompt. The prompt going out last is the
-    // whole design: until that moment the rewrite was browser-only. The leaf is
-    // read immediately before the mutation so the server's optimistic-concurrency
+    // whole design: until Re-ask, the rewrite was browser-only. The leaf is read
+    // immediately before the mutation so the server's optimistic-concurrency
     // check still guards this entry point. (The further `/tree` in between is the
     // background branch re-read that the authoritative refresh always triggers.)
     expect(calls.slice(0, 2)).toEqual([TREE_COMMAND, "navigate"]);
@@ -154,82 +97,57 @@ describe("SessionController edit from here", () => {
       machineId: "local",
     }]);
     expect(prompts).toEqual([{ text: "edited prompt", streamingBehavior: undefined, machineId: "local" }]);
-    // Pi hands the original text back as part of rewinding to it. Accepting that
-    // here would overwrite the edits the user just sent.
-    expect(replacePromptEditorText).not.toHaveBeenCalled();
-    expect(read().promptEditTarget).toBeUndefined();
+    // Pi hands the original text back as part of rewinding. Accepting that copy
+    // would overwrite the edits the user just sent.
+    expect(loadDraft(machineSessionKey("local", oldSession.id))).toBe("");
     expect(read().error).toBe("");
   });
 
-  it("keeps the rewrite armed and gives the text back when the server refuses the rewind", async () => {
-    const { controller, prompts, replacePromptEditorText, read } = editHarness({
+  it("throws the server's refusal to the caller and does not fork", async () => {
+    const { controller, navigations, read } = rewriteHarness({
       runCommand: () => Promise.resolve<CommandResult>({ type: "unsupported", message: "Cannot open the session tree while the session is active. Stop current activity and try /tree again." }),
     });
-    await controller.beginMessageEdit("entry-user", "original prompt");
 
-    await controller.send("edited prompt");
+    // The rejection belongs to the inline editor that is still holding the text;
+    // routing it into `state.error` as well would show the same message twice.
+    await expect(controller.rewriteMessage("entry-user", "edited prompt")).rejects.toThrow("Cannot open the session tree");
 
-    expect(read().error).toBe("Cannot open the session tree while the session is active. Stop current activity and try /tree again.");
-    expect(prompts).toEqual([]);
-    // Nothing moved, so the rewrite is still the right thing to retry — and the
-    // composer emptied itself before handing the text over, so it needs it back.
-    expect(read().promptEditTarget).toEqual({ key, entryId: "entry-user", previousDraft: "" });
-    expect(loadDraft(key)).toBe("edited prompt");
-    expect(replacePromptEditorText).toHaveBeenLastCalledWith({ machineId: "local", sessionId: oldSession.id, text: "edited prompt" });
+    expect(navigations).toEqual([]);
+    expect(read().error).toBe("");
   });
 
   it("refuses a target the session no longer holds", async () => {
-    const { controller, navigations, read } = editHarness();
-    await controller.beginMessageEdit("entry-missing", "original prompt");
+    const { controller, navigations } = rewriteHarness();
 
-    await controller.send("edited prompt");
+    await expect(controller.rewriteMessage("entry-missing", "edited prompt")).rejects.toThrow("no longer part of this session's history");
 
-    expect(read().error).toBe("That message is no longer part of this session's history.");
     expect(navigations).toEqual([]);
-    expect(loadDraft(key)).toBe("edited prompt");
   });
 
-  it("gives the text back as an ordinary draft when the prompt fails after the fork", async () => {
-    const { controller, replacePromptEditorText, read } = editHarness({
+  it("throws a rejected rewind without touching the session error bar", async () => {
+    const { controller, prompts, read } = rewriteHarness({
+      navigateTree: () => Promise.reject(new Error("The session changed since /tree was opened.")),
+    });
+
+    await expect(controller.rewriteMessage("entry-user", "edited prompt")).rejects.toThrow("The session changed since /tree was opened.");
+
+    expect(prompts).toEqual([]);
+    expect(read().error).toBe("");
+  });
+
+  it("throws a rejected prompt after the fork, so the editor can offer a retry that lands on the new branch", async () => {
+    const { controller, navigations, read } = rewriteHarness({
       prompt: () => Promise.reject(new Error("prompt rejected")),
     });
-    await controller.beginMessageEdit("entry-user", "original prompt");
 
-    await controller.send("edited prompt");
+    await expect(controller.rewriteMessage("entry-user", "edited prompt")).rejects.toThrow("prompt rejected");
 
-    // The session already forked, so re-sending would correctly land on the new
-    // branch: the text comes back, the rewrite does not.
-    expect(read().promptEditTarget).toBeUndefined();
-    expect(read().error).toContain("prompt rejected");
-    expect(loadDraft(key)).toBe("edited prompt");
-    expect(replacePromptEditorText).toHaveBeenLastCalledWith({ machineId: "local", sessionId: oldSession.id, text: "edited prompt" });
-  });
-
-  it("leaves an armed rewrite alone when the send turns out to be a command", async () => {
-    const { controller, calls, read } = editHarness();
-    await controller.beginMessageEdit("entry-user", "original prompt");
-
-    await controller.send("/model");
-
-    // A slash command is not a message, so it has no business consuming the
-    // rewrite the user lined up.
-    expect(calls).toEqual(["/model"]);
-    expect(read().promptEditTarget).toEqual({ key, entryId: "entry-user", previousDraft: "" });
-  });
-
-  it("reads a persisted rewrite back when the session is selected again", async () => {
-    saveEditTarget(key, { entryId: "entry-user", previousDraft: "half-written thought" });
-    const { controller, read } = editHarness();
-
-    await controller.selectSession(oldSession, { updateUrl: false });
-
-    // The composer's text survives a reload, so what the text means has to survive
-    // with it, or the next send would quietly do something else.
-    expect(read().promptEditTarget).toEqual({ key, entryId: "entry-user", previousDraft: "half-written thought" });
+    expect(navigations).toHaveLength(1);
+    expect(read().error).toBe("");
   });
 
   it("does nothing for an archived session", async () => {
-    const replacePromptEditorText = vi.fn();
+    const runCommand = vi.fn<typeof defaultApi.runCommand>();
     const archived = { ...oldSession, archived: true };
     let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: archived, sessions: [archived] };
     const controller = new SessionController(
@@ -237,13 +155,12 @@ describe("SessionController edit from here", () => {
       (patch) => { state = { ...state, ...patch }; },
       () => undefined,
       new InMemorySessionSelectionMemory(),
-      { api: { ...defaultApi }, socket: new FakeSocket(), replacePromptEditorText },
+      { api: { ...defaultApi, runCommand }, socket: new FakeSocket() },
     );
 
-    await controller.beginMessageEdit("entry-user", "original prompt");
+    await controller.rewriteMessage("entry-user", "edited prompt");
 
-    expect(state.promptEditTarget).toBeUndefined();
-    expect(replacePromptEditorText).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
   });
 });
 
