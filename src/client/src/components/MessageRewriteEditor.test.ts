@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MessageRewriteEditor } from "./MessageRewriteEditor";
+import type { PromptTextarea } from "./PromptTextarea";
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -9,14 +10,12 @@ afterEach(() => {
 });
 
 describe("MessageRewriteEditor", () => {
-  it("starts from the message's own text and submits what the user made of it", async () => {
+  it("starts the shared editor from the message's own text and submits what the user made of it", async () => {
     const onSubmit = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
     const editor = await renderEditor({ text: "original prompt", onSubmit });
 
-    const textarea = requiredTextarea(editor);
-    expect(textarea.value).toBe("original prompt");
-    textarea.value = "edited prompt";
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(childEditor(editor).view?.state.doc.toString()).toBe("original prompt");
+    setText(editor, "edited prompt");
     await editor.updateComplete;
     reAskButton(editor).click();
 
@@ -32,11 +31,12 @@ describe("MessageRewriteEditor", () => {
     expect(onCancel).toHaveBeenCalledOnce();
   });
 
-  it("cancels on Escape", async () => {
+  it("cancels when the shared editor reports Escape", async () => {
     const onCancel = vi.fn();
     const editor = await renderEditor({ text: "original prompt", onCancel });
 
-    requiredTextarea(editor).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    // The editor core owns the key; the rewrite editor only wires its onEscape.
+    childEditor(editor).onEscape?.();
 
     expect(onCancel).toHaveBeenCalledOnce();
   });
@@ -49,9 +49,9 @@ describe("MessageRewriteEditor", () => {
     await editor.updateComplete;
     await editor.updateComplete;
 
-    // The failure recovery is structural: the text never left this component, so
-    // a refused rewrite is the same editor with an error line and a live button.
-    expect(requiredTextarea(editor).value).toBe("original prompt");
+    // Failure recovery is structural: the text never left the editor, so a
+    // refused rewrite is the same editor with an error line and a live button.
+    expect(childEditor(editor).view?.state.doc.toString()).toBe("original prompt");
     expect(editor.shadowRoot?.querySelector(".error")?.textContent).toContain("Stop current session activity first");
     expect(reAskButton(editor).disabled).toBe(false);
   });
@@ -66,7 +66,7 @@ describe("MessageRewriteEditor", () => {
 
     // A second Re-ask mid-flight would fork twice; a cancel would leave the
     // running rewrite headless. Both wait for the first to settle.
-    expect(requiredTextarea(editor).disabled).toBe(true);
+    expect(childEditor(editor).disabled).toBe(true);
     expect(cancelButton(editor).disabled).toBe(true);
     expect(reAskButton(editor).textContent).toContain("Re-asking…");
     reAskButton(editor).click();
@@ -78,9 +78,7 @@ describe("MessageRewriteEditor", () => {
   it("refuses to send an empty rewrite", async () => {
     const editor = await renderEditor({ text: "original prompt" });
 
-    const textarea = requiredTextarea(editor);
-    textarea.value = "   ";
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    setText(editor, "   ");
     await editor.updateComplete;
 
     expect(reAskButton(editor).disabled).toBe(true);
@@ -93,28 +91,50 @@ describe("MessageRewriteEditor", () => {
     const textOnly = await renderEditor({ text: "original prompt" });
     expect(textOnly.shadowRoot?.querySelector(".note")).toBeNull();
   });
+
+  it("forwards its completion context to the shared editor", async () => {
+    const editor = await renderEditor({ text: "x", cwd: "/repo", sessionId: "s-1", machineId: "m-1" });
+
+    const child = childEditor(editor);
+    expect(child.cwd).toBe("/repo");
+    expect(child.sessionId).toBe("s-1");
+    expect(child.machineId).toBe("m-1");
+  });
 });
 
 async function renderEditor(properties: {
   text: string;
   hasUncarriedParts?: boolean;
+  cwd?: string;
+  sessionId?: string;
+  machineId?: string;
   onSubmit?: (text: string) => Promise<void>;
   onCancel?: () => void;
 }): Promise<MessageRewriteEditor> {
   const editor = new MessageRewriteEditor();
   editor.text = properties.text;
   if (properties.hasUncarriedParts !== undefined) editor.hasUncarriedParts = properties.hasUncarriedParts;
+  if (properties.cwd !== undefined) editor.cwd = properties.cwd;
+  if (properties.sessionId !== undefined) editor.sessionId = properties.sessionId;
+  if (properties.machineId !== undefined) editor.machineId = properties.machineId;
   if (properties.onSubmit !== undefined) editor.onSubmit = properties.onSubmit;
   if (properties.onCancel !== undefined) editor.onCancel = properties.onCancel;
   document.body.append(editor);
   await editor.updateComplete;
+  await childEditor(editor).updateComplete;
   return editor;
 }
 
-function requiredTextarea(editor: MessageRewriteEditor): HTMLTextAreaElement {
-  const textarea = editor.shadowRoot?.querySelector("textarea");
-  if (textarea === null || textarea === undefined) throw new Error("Expected the rewrite editor to render a textarea");
-  return textarea;
+function childEditor(editor: MessageRewriteEditor): PromptTextarea {
+  const child = editor.shadowRoot?.querySelector<PromptTextarea>("prompt-textarea");
+  if (child === null || child === undefined) throw new Error("Expected the rewrite editor to host a prompt-textarea");
+  return child;
+}
+
+function setText(editor: MessageRewriteEditor, text: string): void {
+  const view = childEditor(editor).view;
+  if (view === undefined) throw new Error("Shared editor view not mounted");
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text }, selection: { anchor: text.length } });
 }
 
 function reAskButton(editor: MessageRewriteEditor): HTMLButtonElement {

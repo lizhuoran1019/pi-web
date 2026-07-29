@@ -51,19 +51,6 @@ export function shouldSendPromptOnEnterShortcut(shiftKey: boolean, media = creat
   return shiftKey ? !plainEnterSends : plainEnterSends;
 }
 
-/**
- * What one Enter keypress means in a prompt-editing surface, combining the
- * user's Enter preference with the touch-keyboard Shift compensation. Both
- * editing surfaces — the composer and the inline message rewrite — resolve
- * Enter through here so the key cannot mean different things in different
- * boxes. `explicitShiftKeyActive` is whether the surface saw a real Shift
- * keydown, which is what separates a held Shift from autocapitalization.
- */
-export function resolvePromptEnterAction(shiftKey: boolean, explicitShiftKeyActive: boolean, media = createMobilePromptEnterMedia(), preference = readPromptEnterPreference()): "send" | "newline" {
-  const effectiveShift = shouldUsePromptEnterShiftShortcut(shiftKey, explicitShiftKeyActive, media);
-  return shouldSendPromptOnEnterShortcut(effectiveShift, media, preference) ? "send" : "newline";
-}
-
 function browserStorage(): PromptEnterPreferenceStorage | undefined {
   if (typeof window === "undefined") return undefined;
   try {

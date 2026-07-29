@@ -255,6 +255,12 @@ function chatMessageModelLabel(message: ChatLine): string | undefined {
 export class ChatView extends LitElement {
   @property({ attribute: false }) messages: ChatLine[] = [];
   @property() sessionId = "";
+  /** Completion context forwarded to the inline rewrite editor so `@`/`/` resolve against this session. */
+  @property() cwd?: string;
+  @property() machineId = "local";
+  @property() projectId?: string;
+  @property() workspaceId?: string;
+  @property({ type: Boolean }) workspaceScopedFileSuggestions = false;
   @property({ type: Number }) messageStart = 0;
   @property({ type: Number }) messageEnd = 0;
   @property({ type: Number }) messageTotal = 0;
@@ -1068,6 +1074,12 @@ export class ChatView extends LitElement {
       <message-rewrite-editor
         .text=${this.messageCopyText(message)}
         .hasUncarriedParts=${message.parts.some((part) => part.type !== "text")}
+        .sessionId=${this.sessionId}
+        .cwd=${this.cwd}
+        .machineId=${this.machineId}
+        .projectId=${this.projectId}
+        .workspaceId=${this.workspaceId}
+        .workspaceScopedFileSuggestions=${this.workspaceScopedFileSuggestions}
         .onSubmit=${(text: string) => this.submitRewrite(message.entryId ?? "", text)}
         .onCancel=${() => { this.cancelRewrite(index); }}
       ></message-rewrite-editor>

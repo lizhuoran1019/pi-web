@@ -1,7 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// @vitest-environment happy-dom
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { machineSessionKey } from "../machineKeys";
 import { loadDraft, saveDraft } from "../promptDraftStorage";
 import { PromptEditor } from "./PromptEditor";
+import type { PromptTextarea } from "./PromptTextarea";
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -19,66 +22,53 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  document.body.replaceChildren();
   Object.defineProperty(globalThis, "localStorage", { value: undefined, configurable: true });
 });
 
 describe("PromptEditor draft replacement", () => {
-  it("replaces durable and CodeMirror text, moves the cursor, and resets completion state", () => {
-    const editor = new PromptEditor();
-    editor.machineId = "remote-a";
-    editor.sessionId = "session-1";
-    const dispatch = vi.fn<(transaction: unknown) => void>();
-    Reflect.set(editor, "draft", "/old");
-    Reflect.set(editor, "currentInputMode", { kind: "command" });
-    Reflect.set(editor, "completions", [{ kind: "command", insertText: "/tree", replaceFrom: 0, replaceTo: 4 }]);
-    Reflect.set(editor, "selectedIndex", 3);
-    Reflect.set(editor, "requestVersion", 7);
-    Reflect.set(editor, "editor", {
-      state: { doc: { toString: () => "/old" } },
-      dispatch,
-    });
+  it("persists the replacement, updates shell mode, and hands the text to the shared editor", async () => {
+    const editor = await renderEditor("remote-a", "session-1");
 
     editor.replaceText("!pwd");
+    await editor.updateComplete;
 
-    expect(Reflect.get(editor, "draft")).toBe("!pwd");
+    // The composer still owns draft persistence and the shell-mode derivation;
+    // the text itself is pushed into the shared editor.
     expect(loadDraft(machineSessionKey("remote-a", "session-1"))).toBe("!pwd");
-    expect(Reflect.get(editor, "currentInputMode")).toEqual({ kind: "shell", excludeFromContext: false });
-    expect(Reflect.get(editor, "completions")).toEqual([]);
-    expect(Reflect.get(editor, "selectedIndex")).toBe(0);
-    expect(Reflect.get(editor, "requestVersion")).toBe(8);
-    expect(dispatch).toHaveBeenCalledOnce();
-    const transaction = dispatch.mock.calls[0]?.[0];
-    if (!isRecord(transaction) || !isRecord(transaction["selection"])) throw new Error("Expected a CodeMirror replacement transaction");
-    expect(transaction["changes"]).toEqual({ from: 0, to: 4, insert: "!pwd" });
-    expect(transaction["selection"]["anchor"]).toBe(4);
-    expect(transaction["selection"]["head"]).toBe(4);
+    expect(childEditor(editor).view?.state.doc.toString()).toBe("!pwd");
+    expect(editor.shadowRoot?.querySelector(".mode-hint")?.textContent).toContain("Shell command");
   });
 
-  it("clears an existing durable draft and CodeMirror document", () => {
-    const editor = new PromptEditor();
-    editor.machineId = "local";
-    editor.sessionId = "session-2";
+  it("clears the persisted draft and the shared editor document", async () => {
+    const editor = await renderEditor("local", "session-2");
     const key = machineSessionKey("local", "session-2");
-    const dispatch = vi.fn<(transaction: unknown) => void>();
-    Reflect.set(editor, "draft", "stale text");
-    Reflect.set(editor, "editor", {
-      state: { doc: { toString: () => "stale text" } },
-      dispatch,
-    });
     saveDraft(key, "stale text");
+    editor.replaceText("stale text");
+    await editor.updateComplete;
 
     editor.replaceText("");
+    await editor.updateComplete;
 
     expect(loadDraft(key)).toBe("");
-    const transaction = dispatch.mock.calls[0]?.[0];
-    if (!isRecord(transaction) || !isRecord(transaction["selection"])) throw new Error("Expected a CodeMirror clearing transaction");
-    expect(transaction["changes"]).toEqual({ from: 0, to: 10, insert: "" });
-    expect(transaction["selection"]["anchor"]).toBe(0);
-    expect(transaction["selection"]["head"]).toBe(0);
-    expect(Reflect.get(editor, "currentInputMode")).toEqual({ kind: "normal" });
+    expect(childEditor(editor).view?.state.doc.toString()).toBe("");
+    expect(editor.shadowRoot?.querySelector(".mode-hint")).toBeNull();
   });
 });
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+async function renderEditor(machineId: string, sessionId: string): Promise<PromptEditor> {
+  const editor = new PromptEditor();
+  editor.machineId = machineId;
+  editor.sessionId = sessionId;
+  document.body.append(editor);
+  await editor.updateComplete;
+  const child = editor.shadowRoot?.querySelector<PromptTextarea>("prompt-textarea");
+  await child?.updateComplete;
+  return editor;
+}
+
+function childEditor(editor: PromptEditor): PromptTextarea {
+  const child = editor.shadowRoot?.querySelector<PromptTextarea>("prompt-textarea");
+  if (child === null || child === undefined) throw new Error("Expected the composer to host a prompt-textarea");
+  return child;
 }

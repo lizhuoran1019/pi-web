@@ -1,25 +1,21 @@
-import { defaultKeymap, history, historyKeymap, indentWithTab, insertNewlineAndIndent } from "@codemirror/commands";
-import { markdown, deleteMarkupBackward, insertNewlineContinueMarkup } from "@codemirror/lang-markdown";
-import { EditorSelection, EditorState, Compartment } from "@codemirror/state";
-import { EditorView, keymap, placeholder } from "@codemirror/view";
-import { defaultHighlightStyle, indentOnInput, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { LitElement, html, type PropertyValues } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
-import { api, type FileSuggestion, type PromptAttachment, type SessionStatus, type SlashCommand } from "../api";
+import type { PromptAttachment, SessionStatus } from "../api";
 import type { PromptAttachmentDelivery } from "../../../shared/apiTypes";
 import { capturePromptAttachments, effectivePromptAttachmentDelivery, isInlinePromptAttachment, promptAttachmentsCanUseInlineDelivery, type CapturedAttachment } from "../promptAttachmentCapture";
 import { inputModeForDraft, inputModesEqual, type InputMode } from "../inputModes";
 import { machineSessionKey } from "../machineKeys";
-import { detectPromptCompletionTrigger, fileCompletionInsertText, type PromptCompletionTrigger } from "../promptCompletions";
 import { clearDraft, loadDraft, saveDraft } from "../promptDraftStorage";
 import { loadAttachmentDelivery, saveAttachmentDelivery } from "../attachmentPreferences";
-import { createMobilePromptEnterMedia, readPromptEnterPreference, shouldSendPromptOnEnterShortcut, shouldUsePromptEnterShiftShortcut } from "../promptEnterBehavior";
-import { promptEditorStyles, type CompletionItem } from "./shared";
+import { promptEditorStyles } from "./shared";
 import { renderAttachIcon, renderSendIcon, renderQueueIcon, renderSteerIcon, renderStopIcon, renderThinkingGauge } from "./promptEditorIcons";
 import { thinkingGauge, thinkingLevelLabel } from "../../../shared/thinkingLevels";
-import "./AutocompleteMenu";
+import type { PromptTextarea } from "./PromptTextarea";
+import "./PromptTextarea";
 
 type PendingAttachment = CapturedAttachment & { id: string };
+
+const PROMPT_PLACEHOLDER = "Message pi... Use / for commands, @ for tracked files, @ space for all files";
 
 @customElement("prompt-editor")
 export class PromptEditor extends LitElement {
@@ -40,28 +36,18 @@ export class PromptEditor extends LitElement {
   @property({ attribute: false }) onSelectModel?: () => void;
   @property({ attribute: false }) onSelectThinking?: () => void;
   @property({ attribute: false }) availableThinkingLevels: readonly string[] = [];
-  @query(".markdown-editor") private editorHost?: HTMLDivElement;
   @query(".attachment-input") private attachmentInput?: HTMLInputElement;
-  // `draft` is the live document text but is intentionally NOT reactive: it
-  // changes on every keystroke and the visible text is owned by CodeMirror, not
-  // by Lit's render. Re-rendering the surrounding template on each keystroke is
-  // wasted work and, on iOS, can interrupt an in-progress touch gesture (the
-  // long-press edit/paste callout). Only `currentInputMode` (shell vs. normal)
-  // is reactive, since that is the only draft-derived value the template shows.
+  @query("prompt-textarea") private textarea?: PromptTextarea;
+  // `draft` mirrors the editor's text but is intentionally NOT reactive: it
+  // changes on every keystroke and the visible text is owned by the editor, not
+  // by Lit's render. Only `currentInputMode` (shell vs. normal) is reactive,
+  // since that is the only draft-derived value this template shows.
   private draft = "";
   @state() private currentInputMode: InputMode = { kind: "normal" };
-  @state() private completions: CompletionItem[] = [];
-  @state() private selectedIndex = 0;
   @state() private attachments: PendingAttachment[] = [];
   @state() private attachmentDelivery: PromptAttachmentDelivery = loadAttachmentDelivery();
   @state() private attachmentError: string | undefined = undefined;
   private attachmentSeq = 0;
-  private requestVersion = 0;
-  private editor: EditorView | undefined;
-  private readonly editableCompartment = new Compartment();
-  private readonly readOnlyCompartment = new Compartment();
-  private readonly mobilePromptEnterMedia = createMobilePromptEnterMedia();
-  private explicitShiftKeyActive = false;
 
   protected override willUpdate(changed: PropertyValues<this>) {
     if (!changed.has("sessionId") && !changed.has("machineId")) return;
@@ -72,8 +58,6 @@ export class PromptEditor extends LitElement {
     const currentKey = draftStorageKey(this.machineId, this.sessionId);
     this.draft = currentKey !== undefined ? loadDraft(currentKey) : "";
     this.currentInputMode = inputModeForDraft(this.draft);
-    this.completions = [];
-    this.selectedIndex = 0;
   }
 
   protected override shouldUpdate(changed: PropertyValues<this>): boolean {
@@ -87,21 +71,6 @@ export class PromptEditor extends LitElement {
     return true;
   }
 
-  override firstUpdated(): void {
-    this.createEditor();
-  }
-
-  protected override updated(changed: PropertyValues) {
-    if (changed.has("disabled")) this.updateEditorDisabledState();
-    if (changed.has("sessionId") || changed.has("machineId")) this.syncEditorDoc();
-  }
-
-  override disconnectedCallback(): void {
-    this.editor?.destroy();
-    this.editor = undefined;
-    super.disconnectedCallback();
-  }
-
   override render() {
     const shellInputMode = this.currentInputMode.kind === "shell" ? this.currentInputMode : undefined;
     const shellMode = shellInputMode !== undefined;
@@ -109,14 +78,25 @@ export class PromptEditor extends LitElement {
     const busy = this.disabled || this.sending;
     return html`
       <footer class=${shellMode ? "shell-mode" : ""} @paste=${(event: ClipboardEvent) => { void this.handlePaste(event); }} @dragover=${(event: DragEvent) => { this.handleDragOver(event); }} @drop=${(event: DragEvent) => { void this.handleDrop(event); }}>
-        <div class="editor-wrap">
-          <div class=${`markdown-editor${this.disabled ? " markdown-editor-disabled" : ""}`} aria-label="Message pi" aria-disabled=${this.disabled ? "true" : "false"}></div>
+        <div class=${`editor-wrap${shellMode ? " shell-mode" : ""}`}>
+          <prompt-textarea
+            placeholder=${PROMPT_PLACEHOLDER}
+            .value=${this.draft}
+            ?disabled=${this.disabled}
+            .sessionId=${this.sessionId}
+            .cwd=${this.cwd}
+            .machineId=${this.machineId}
+            .projectId=${this.projectId}
+            .workspaceId=${this.workspaceId}
+            .workspaceScopedFileSuggestions=${this.workspaceScopedFileSuggestions}
+            .onInput=${(value: string) => { this.updateDraft(value); }}
+            .onSubmit=${() => { this.send(this.canSteer || this.isCompacting ? "followUp" : undefined); }}
+          ></prompt-textarea>
           <input class="attachment-input" type="file" multiple hidden @change=${(event: Event) => { void this.handleFileInput(event); }} />
           <button class="editor-attach icon-button" ?disabled=${busy} title="Attach files" aria-label="Attach files" @click=${() => { this.attachmentInput?.click(); }}>${renderAttachIcon()}</button>
           ${shellMode ? html`<div class="mode-hint">Shell command${shellInputMode.excludeFromContext ? " · excluded from context" : ""}</div>` : null}
           ${this.isCompacting && !shellMode ? html`<div class="mode-hint">Compacting history · message will be queued</div>` : null}
           ${this.renderAttachments()}
-          <autocomplete-menu .items=${this.completions} .selectedIndex=${this.selectedIndex} .onPick=${(item: CompletionItem) => { this.pick(item); }}></autocomplete-menu>
         </div>
         <div class="actions">
           ${this.renderCompactStatus()}
@@ -129,34 +109,20 @@ export class PromptEditor extends LitElement {
   }
 
   focusInput() {
-    this.editor?.focus();
+    this.textarea?.focusEditor();
+  }
+
+  /** The composer's underlying CM6 view, exposed for the plugin prompt-editor bridge. */
+  get view(): import("@codemirror/view").EditorView | undefined {
+    return this.textarea?.view;
   }
 
   replaceText(text: string): void {
     this.draft = text;
     const key = draftStorageKey(this.machineId, this.sessionId);
     if (key !== undefined) saveDraft(key, text);
-
-    const editor = this.editor;
-    if (editor !== undefined) {
-      const current = editor.state.doc.toString();
-      editor.dispatch({
-        ...(current === text ? {} : { changes: { from: 0, to: current.length, insert: text } }),
-        selection: EditorSelection.cursor(text.length),
-      });
-    }
-
-    // Invalidate completion requests started for either the previous document or
-    // the replacement dispatch, then return the editor to a clean completion state.
-    this.requestVersion += 1;
     this.currentInputMode = inputModeForDraft(text);
-    this.completions = [];
-    this.selectedIndex = 0;
-  }
-
-  /** Get the underlying CM6 EditorView, or undefined if not yet mounted. */
-  get view(): EditorView | undefined {
-    return this.editor;
+    this.textarea?.replaceText(text);
   }
 
   private renderCompactStatus() {
@@ -265,197 +231,12 @@ export class PromptEditor extends LitElement {
     return effectivePromptAttachmentDelivery(this.attachmentDelivery, this.attachments);
   }
 
-  private createEditor() {
-    if (!this.editorHost || this.editor !== undefined) return;
-    this.editor = new EditorView({
-      parent: this.editorHost,
-      state: EditorState.create({
-        doc: this.draft,
-        extensions: [
-          history(),
-          markdown(),
-          indentOnInput(),
-          indentUnit.of("  "),
-          syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-          EditorView.lineWrapping,
-          EditorView.contentAttributes.of((view) => inputAssistanceContentAttributes(view.state.sliceDoc(0, view.state.selection.main.head))),
-          EditorView.domEventHandlers({
-            keyup: (event) => this.handleEditorKeyUp(event),
-            blur: () => this.resetEditorModifierState(),
-          }),
-          placeholder("Message pi... Use / for commands, @ for tracked files, @ space for all files"),
-          this.editableCompartment.of(EditorView.editable.of(!this.disabled)),
-          this.readOnlyCompartment.of(EditorState.readOnly.of(this.disabled)),
-          EditorView.updateListener.of((update) => {
-            if (update.docChanged) this.updateDraft(update.state.doc.toString());
-          }),
-          keymap.of([
-            { any: (view, event) => this.handleEditorKeyDown(event, view) },
-            { key: "ArrowDown", run: () => this.moveCompletion(1) },
-            { key: "ArrowUp", run: () => this.moveCompletion(-1) },
-            { key: "Escape", run: () => this.closeCompletions() },
-            { key: "Tab", run: (view) => this.handleEditorTab(view) },
-            { key: "Shift-Tab", run: (view) => indentWithTab.shift?.(view) ?? false },
-            { key: "Backspace", run: (view) => deleteMarkupBackward(view) },
-            ...historyKeymap,
-            ...defaultKeymap,
-          ]),
-        ],
-      }),
-    });
-  }
-
-  private syncEditorDoc() {
-    const editor = this.editor;
-    if (!editor) return;
-    const current = editor.state.doc.toString();
-    if (current === this.draft) return;
-    editor.dispatch({
-      changes: { from: 0, to: current.length, insert: this.draft },
-      selection: EditorSelection.cursor(this.draft.length),
-    });
-  }
-
-  private updateEditorDisabledState() {
-    this.editor?.dispatch({
-      effects: [
-        this.editableCompartment.reconfigure(EditorView.editable.of(!this.disabled)),
-        this.readOnlyCompartment.reconfigure(EditorState.readOnly.of(this.disabled)),
-      ],
-    });
-  }
-
   private updateDraft(value: string) {
     this.draft = value;
     const key = draftStorageKey(this.machineId, this.sessionId);
     if (key !== undefined) saveDraft(key, this.draft);
     const nextInputMode = inputModeForDraft(this.draft);
     if (!inputModesEqual(nextInputMode, this.currentInputMode)) this.currentInputMode = nextInputMode;
-    void this.refreshCompletions();
-  }
-
-  private async refreshCompletions() {
-    const trigger = this.currentTrigger();
-    const version = ++this.requestVersion;
-    this.selectedIndex = 0;
-    if (trigger === undefined) {
-      this.completions = [];
-      return;
-    }
-    if (trigger.kind === "command" && this.sessionId !== undefined && this.sessionId !== "" && this.cwd !== undefined && this.cwd !== "") {
-      const commands = await api.commands({ id: this.sessionId, cwd: this.cwd }, this.machineId).catch(emptySlashCommands);
-      if (version !== this.requestVersion) return;
-      this.completions = commands
-        .filter((command) => command.name.toLowerCase().includes(trigger.query.toLowerCase()))
-        .slice(0, 12)
-        .map((command) => ({
-          kind: "command",
-          replaceFrom: trigger.from,
-          replaceTo: trigger.to,
-          insertText: `/${command.name}`,
-          detail: command.source,
-          ...(command.description === undefined ? {} : { description: command.description }),
-        }));
-    } else if (trigger.kind === "file" && this.cwd !== undefined && this.cwd !== "") {
-      const files = await api.files(this.cwd, trigger.query, { scope: trigger.fileScope, machineId: this.machineId, projectId: this.projectId, workspaceId: this.workspaceId, workspaceScoped: this.workspaceScopedFileSuggestions }).catch(emptyFileSuggestions);
-      if (version !== this.requestVersion) return;
-      this.completions = files
-        .slice(0, 12)
-        .map((file) => {
-          const insertText = fileCompletionInsertText(file.path, trigger.quoted === true, file.path.endsWith("/") ? trigger.allPrefix : undefined);
-          return {
-            kind: "file",
-            replaceFrom: trigger.from,
-            replaceTo: trigger.to,
-            insertText,
-            detail: file.kind,
-            ...(file.path.endsWith("/") && insertText.endsWith("\"") ? { cursorOffset: insertText.length - 1 } : {}),
-          };
-        });
-    }
-  }
-
-  private currentTrigger(): PromptCompletionTrigger | undefined {
-    return detectPromptCompletionTrigger(this.draft, this.editor?.state.selection.main.head ?? this.draft.length);
-  }
-
-  private moveCompletion(delta: number): boolean {
-    if (!this.completions.length) return false;
-    this.selectedIndex = (this.selectedIndex + delta + this.completions.length) % this.completions.length;
-    return true;
-  }
-
-  private closeCompletions(): boolean {
-    if (!this.completions.length) return false;
-    this.completions = [];
-    return true;
-  }
-
-  private handleEditorKeyDown(event: KeyboardEvent, view: EditorView): boolean {
-    if (event.key === "Shift") {
-      this.explicitShiftKeyActive = true;
-      return false;
-    }
-    if (event.key !== "Enter") {
-      this.explicitShiftKeyActive = false;
-      return false;
-    }
-    if (event.defaultPrevented || event.isComposing || view.composing) return false;
-
-    const shiftKey = shouldUsePromptEnterShiftShortcut(event.shiftKey, this.explicitShiftKeyActive, this.mobilePromptEnterMedia);
-    this.explicitShiftKeyActive = false;
-    return this.handleEditorEnter(view, shiftKey);
-  }
-
-  private handleEditorKeyUp(event: KeyboardEvent): boolean {
-    if (event.key === "Shift") this.explicitShiftKeyActive = false;
-    return false;
-  }
-
-  private resetEditorModifierState(): boolean {
-    this.explicitShiftKeyActive = false;
-    return false;
-  }
-
-  private handleEditorEnter(view: EditorView, shiftKey: boolean): boolean {
-    if (!shiftKey && this.completions.length) {
-      const completion = this.completions[this.selectedIndex];
-      if (completion !== undefined) this.pick(completion);
-      return true;
-    }
-    if (!shouldSendPromptOnEnterShortcut(shiftKey, this.mobilePromptEnterMedia, readPromptEnterPreference())) {
-      return insertNewlineContinueMarkup(view) || insertNewlineAndIndent(view);
-    }
-    this.send(this.canSteer || this.isCompacting ? "followUp" : undefined);
-    return true;
-  }
-
-  private handleEditorTab(view: EditorView): boolean {
-    if (this.completions.length) {
-      const completion = this.completions[this.selectedIndex];
-      if (completion !== undefined) this.pick(completion);
-      return true;
-    }
-    const trigger = this.currentTrigger();
-    if (trigger?.kind === "file") {
-      void this.refreshCompletions();
-      return true;
-    }
-    return indentWithTab.run?.(view) ?? false;
-  }
-
-  private pick(item: CompletionItem) {
-    const editor = this.editor;
-    if (!editor) return;
-    const suffix = item.kind === "file" && (item.insertText.endsWith("/") || item.cursorOffset !== undefined) ? "" : " ";
-    const cursor = item.replaceFrom + (item.cursorOffset ?? item.insertText.length) + suffix.length;
-    const replaceTo = item.insertText.endsWith("\"") && this.draft.slice(item.replaceTo).startsWith("\"") ? item.replaceTo + 1 : item.replaceTo;
-    editor.dispatch({
-      changes: { from: item.replaceFrom, to: replaceTo, insert: `${item.insertText}${suffix}` },
-      selection: EditorSelection.cursor(cursor),
-      scrollIntoView: true,
-    });
-    this.completions = [];
   }
 
   private send(streamingBehavior?: "steer" | "followUp") {
@@ -478,12 +259,11 @@ export class PromptEditor extends LitElement {
     this.currentInputMode = { kind: "normal" };
     const key = draftStorageKey(this.machineId, this.sessionId);
     if (key !== undefined) clearDraft(key);
-    this.completions = [];
     this.attachments = [];
     this.attachmentError = undefined;
-    // `draft` is not reactive, so the cleared text will not flow to CodeMirror
-    // via `updated()`; push it to the editor document explicitly.
-    this.syncEditorDoc();
+    // `draft` is not reactive, so the cleared text will not flow to the editor
+    // through a `value` change; push it in explicitly.
+    this.textarea?.replaceText("");
   }
 
   static override styles = promptEditorStyles;
@@ -506,14 +286,6 @@ function draftStorageKey(machineId: unknown, sessionId: unknown): string | undef
   if (typeof machineId !== "string" || machineId === "") return undefined;
   if (typeof sessionId !== "string" || sessionId === "") return undefined;
   return machineSessionKey(machineId, sessionId);
-}
-
-function emptySlashCommands(): SlashCommand[] {
-  return [];
-}
-
-function emptyFileSuggestions(): FileSuggestion[] {
-  return [];
 }
 
 function filesFromDataTransfer(data: DataTransfer | null): File[] {
@@ -554,25 +326,3 @@ function readFileAsBase64(file: File): Promise<string> {
     reader.readAsDataURL(file);
   });
 }
-
-const proseInputAssistanceAttributes: Record<string, string> = {
-  spellcheck: "true",
-  autocorrect: "on",
-  autocapitalize: "sentences",
-  writingsuggestions: "true",
-  dir: "auto",
-};
-
-const codeLikeInputAssistanceAttributes: Record<string, string> = {
-  spellcheck: "false",
-  autocorrect: "off",
-  autocapitalize: "off",
-  writingsuggestions: "false",
-  dir: "auto",
-};
-
-function inputAssistanceContentAttributes(draftBeforeCursor: string): Record<string, string> {
-  // CodeMirror is optimized for code and disables these by default, but the chat prompt is usually prose.
-  return inputModeForDraft(draftBeforeCursor).kind === "normal" ? proseInputAssistanceAttributes : codeLikeInputAssistanceAttributes;
-}
-
