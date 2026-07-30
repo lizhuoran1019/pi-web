@@ -95,10 +95,12 @@ describe("MessageRewriteEditor", () => {
   it("forwards its completion context to the shared editor", async () => {
     const editor = await renderEditor({ text: "x", cwd: "/repo", sessionId: "s-1", machineId: "m-1" });
 
-    const child = childEditor(editor);
-    expect(child.cwd).toBe("/repo");
-    expect(child.sessionId).toBe("s-1");
-    expect(child.machineId).toBe("m-1");
+    expect(childEditor(editor).completionContext).toEqual({
+      cwd: "/repo",
+      sessionId: "s-1",
+      machineId: "m-1",
+      workspaceScopedFileSuggestions: false,
+    });
   });
 });
 
@@ -114,9 +116,12 @@ async function renderEditor(properties: {
   const editor = new MessageRewriteEditor();
   editor.text = properties.text;
   if (properties.hasUncarriedParts !== undefined) editor.hasUncarriedParts = properties.hasUncarriedParts;
-  if (properties.cwd !== undefined) editor.cwd = properties.cwd;
-  if (properties.sessionId !== undefined) editor.sessionId = properties.sessionId;
-  if (properties.machineId !== undefined) editor.machineId = properties.machineId;
+  editor.completionContext = {
+    machineId: properties.machineId ?? "local",
+    workspaceScopedFileSuggestions: false,
+    ...(properties.cwd === undefined ? {} : { cwd: properties.cwd }),
+    ...(properties.sessionId === undefined ? {} : { sessionId: properties.sessionId }),
+  };
   if (properties.onSubmit !== undefined) editor.onSubmit = properties.onSubmit;
   if (properties.onCancel !== undefined) editor.onCancel = properties.onCancel;
   document.body.append(editor);

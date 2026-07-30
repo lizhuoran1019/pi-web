@@ -42,6 +42,7 @@ describe("SessionController message rewrite", () => {
     const calls: string[] = [];
     const navigations: unknown[] = [];
     const prompts: unknown[] = [];
+    const replacePromptEditorText = vi.fn();
     let state: AppState = { ...initialAppState(), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };
     const controller = new SessionController(
       () => state,
@@ -51,7 +52,7 @@ describe("SessionController message rewrite", () => {
       {
         api: {
           ...defaultApi,
-          runCommand: (session, text) => {
+          runCommand: (_session, text) => {
             calls.push(text);
             return Promise.resolve<CommandResult>({ type: "tree", tree });
           },
@@ -60,7 +61,7 @@ describe("SessionController message rewrite", () => {
             navigations.push({ sessionId: sessionLookupId(session), request, machineId });
             return Promise.resolve({ cancelled: false, editorText: "original prompt" });
           },
-          prompt: (session, text, streamingBehavior, machineId) => {
+          prompt: (_session, text, streamingBehavior, machineId) => {
             calls.push("prompt");
             prompts.push({ text, streamingBehavior, machineId });
             return Promise.resolve({ accepted: true as const });
@@ -72,9 +73,10 @@ describe("SessionController message rewrite", () => {
           ...overrides,
         },
         socket: new FakeSocket(),
+        replacePromptEditorText,
       },
     );
-    return { controller, calls, navigations, prompts, read: () => state };
+    return { controller, calls, navigations, prompts, replacePromptEditorText, read: () => state };
   }
 
   it("rewinds to the message's own entry before sending the rewrite, without summarizing", async () => {
@@ -135,15 +137,41 @@ describe("SessionController message rewrite", () => {
     expect(read().error).toBe("");
   });
 
-  it("throws a rejected prompt after the fork, so the editor can offer a retry that lands on the new branch", async () => {
-    const { controller, navigations, read } = rewriteHarness({
+  it("hands a rejected prompt back to the composer after the fork", async () => {
+    const { controller, navigations, replacePromptEditorText, read } = rewriteHarness({
       prompt: () => Promise.reject(new Error("prompt rejected")),
     });
 
     await expect(controller.rewriteMessage("entry-user", "edited prompt")).rejects.toThrow("prompt rejected");
 
     expect(navigations).toHaveLength(1);
+    expect(loadDraft(machineSessionKey("local", oldSession.id))).toBe("edited prompt");
+    expect(replacePromptEditorText).toHaveBeenCalledExactlyOnceWith({ machineId: "local", sessionId: oldSession.id, text: "edited prompt" });
+    expect(read().sendingPrompts).toEqual({});
     expect(read().error).toBe("");
+  });
+
+  it("locks the composer from the leaf read through prompt delivery", async () => {
+    let releaseLeafRead: (result: CommandResult) => void = () => undefined;
+    let leafReadPending = true;
+    const runCommand = vi.fn<typeof defaultApi.runCommand>(() => {
+      if (!leafReadPending) return Promise.resolve<CommandResult>({ type: "tree", tree });
+      leafReadPending = false;
+      return new Promise<CommandResult>((resolve) => { releaseLeafRead = resolve; });
+    });
+    const { controller, prompts, read } = rewriteHarness({ runCommand });
+
+    const rewrite = controller.rewriteMessage("entry-user", "edited prompt");
+    expect(read().sendingPrompts).toEqual({ [oldSession.id]: true });
+
+    await controller.send("competing prompt");
+    expect(prompts).toEqual([]);
+
+    releaseLeafRead({ type: "tree", tree });
+    await rewrite;
+
+    expect(prompts).toEqual([{ text: "edited prompt", streamingBehavior: undefined, machineId: "local" }]);
+    expect(read().sendingPrompts).toEqual({});
   });
 
   it("does nothing for an archived session", async () => {

@@ -110,9 +110,12 @@ async function renderEditor(properties: {
   cwd?: string;
 } = {}): Promise<PromptTextarea> {
   const editor = new PromptTextarea();
-  editor.sessionId = "session-1";
-  editor.machineId = "local";
-  if (properties.cwd !== undefined) editor.cwd = properties.cwd;
+  editor.completionContext = {
+    sessionId: "session-1",
+    machineId: "local",
+    workspaceScopedFileSuggestions: false,
+    ...(properties.cwd === undefined ? {} : { cwd: properties.cwd }),
+  };
   if (properties.onInput !== undefined) editor.onInput = properties.onInput;
   if (properties.onSubmit !== undefined) editor.onSubmit = properties.onSubmit;
   if (properties.onEscape !== undefined) editor.onEscape = properties.onEscape;

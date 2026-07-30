@@ -340,11 +340,11 @@ describe("chatEditFromHereAction", () => {
   });
 
   it("offers the action on a user line that identifies its session entry", () => {
-    expect(chatEditFromHereAction(userLine("entry-1"), false)).toEqual({ entryId: "entry-1", disabledReason: undefined });
+    expect(chatEditFromHereAction(userLine("entry-1"), false)).toEqual({ entryId: "entry-1" });
   });
 
-  it("disables the action while the session has work in flight", () => {
-    expect(chatEditFromHereAction(userLine("entry-1"), true)).toEqual({ entryId: "entry-1", disabledReason: "stop current activity first" });
+  it("offers no action while the session has work in flight", () => {
+    expect(chatEditFromHereAction(userLine("entry-1"), true)).toBeUndefined();
   });
 
   it("offers nothing when the line cannot be addressed by entry id", () => {

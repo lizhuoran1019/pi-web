@@ -305,8 +305,9 @@ export class SessionController {
   }
 
   async send(text: string, streamingBehavior?: "steer" | "followUp", attachments?: PromptAttachment[], delivery: PromptAttachmentDelivery = "inline") {
-    const session = this.getState().selectedSession;
-    if (!session || session.archived === true) return;
+    const state = this.getState();
+    const session = state.selectedSession;
+    if (!session || session.archived === true || state.sendingPrompts[session.id] === true) return;
 
     const trimmed = text.trim();
     const hasAttachments = attachments !== undefined && attachments.length > 0;
@@ -322,7 +323,7 @@ export class SessionController {
     // Capture the originating session/machine before any await so the request
     // and its sending indicator stay bound to the right session even if the
     // user navigates elsewhere mid-upload.
-    await this.deliverPromptToSession(session, text, streamingBehavior, attachments, delivery, selectedMachineId(this.getState()), { markSending: hasAttachments });
+    await this.deliverPromptToSession(session, text, streamingBehavior, attachments, delivery, selectedMachineId(state), { markSending: hasAttachments });
   }
 
   private markSendingPrompt(sessionId: string, sending: boolean): void {
@@ -498,25 +499,59 @@ export class SessionController {
     const state = this.getState();
     const session = state.selectedSession;
     if (session === undefined || session.archived === true || isClientPendingStartSessionInfo(session)) return;
+    if (state.sendingPrompts[session.id] === true) throw new Error("Another message is already being sent for this session.");
     const machineId = selectedMachineId(state);
     const selectionSeq = this.selectionSeq;
 
-    const result = await this.api.runCommand(session, TREE_COMMAND, machineId);
-    if (result.type !== "tree") throw new Error(treeUnavailableMessage(result));
-    if (!this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) return;
-    if (!result.tree.nodes.some((node) => node.id === entryId)) {
-      throw new Error("That message is no longer part of this session's history.");
-    }
+    // The rewind runs a command, a mutation and a full transcript refresh before
+    // the prompt goes out. Keep one session-level lock across that whole window so
+    // the composer cannot insert a competing message onto either branch.
+    this.markSendingPrompt(session.id, true);
+    try {
+      const result = await this.api.runCommand(session, TREE_COMMAND, machineId);
+      if (result.type !== "tree") throw new Error(treeUnavailableMessage(result));
+      if (!this.isCurrentSessionSelection(session.id, machineId, selectionSeq)) {
+        await this.restoreComposerText(session, machineId, text);
+        return;
+      }
+      if (!result.tree.nodes.some((node) => node.id === entryId)) {
+        throw new Error("That message is no longer part of this session's history.");
+      }
 
-    // Pi hands a re-edited message's text back for the editor. This path already
-    // holds the text the user wants to send — theirs, possibly edited — so
-    // accepting pi's copy would overwrite their edits with the original.
-    const navigation = await this.runTreeNavigation(session, { targetId: entryId, expectedLeafId: result.tree.activeLeafId, summary: { mode: "none" } }, undefined, { handBackEditorText: false, reportErrors: false });
-    if (navigation.cancelled) throw new Error("The rewind was cancelled before the session moved.");
-    // Reselecting elsewhere during the rewind means this prompt no longer has a
-    // place to go; the editor holding the text was unmounted with the transcript.
+      // Pi hands a re-edited message's text back for the editor. This path already
+      // holds the text the user wants to send — theirs, possibly edited — so
+      // accepting pi's copy would overwrite their edits with the original.
+      const navigation = await this.runTreeNavigation(session, { targetId: entryId, expectedLeafId: result.tree.activeLeafId, summary: { mode: "none" } }, undefined, { handBackEditorText: false, reportErrors: false });
+      if (navigation.cancelled) throw new Error("The rewind was cancelled before the session moved.");
+      // Reselecting elsewhere during the rewind unmounts the inline editor. Keep
+      // the text as that session's composer draft even though it cannot be sent.
+      if (!this.isSelectedSessionIdentity(session.id, machineId)) {
+        await this.restoreComposerText(session, machineId, text);
+        return;
+      }
+      try {
+        await this.api.prompt(session, text, undefined, machineId);
+      } catch (error) {
+        // The authoritative rewind refresh can unmount the inline editor before
+        // prompt delivery fails. Hand the text to the composer so retrying never
+        // depends on a detached component still holding it in memory.
+        await this.restoreComposerText(session, machineId, text);
+        throw error;
+      }
+    } finally {
+      this.markSendingPrompt(session.id, false);
+    }
+  }
+
+  /** Persist text for its session and update the visible composer when it still owns that session. */
+  private async restoreComposerText(session: SessionInfo, machineId: string, text: string): Promise<void> {
+    saveDraft(machineSessionKey(machineId, session.id), text);
     if (!this.isSelectedSessionIdentity(session.id, machineId)) return;
-    await this.api.prompt(session, text, undefined, machineId);
+    try {
+      await this.replacePromptEditorText?.({ machineId, sessionId: session.id, text });
+    } catch (error) {
+      if (this.getState().error === "") this.setState({ error: String(error) });
+    }
   }
 
   /**

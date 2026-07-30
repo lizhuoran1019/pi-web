@@ -12,6 +12,21 @@ import { createMobilePromptEnterMedia, readPromptEnterPreference, shouldSendProm
 import { autocompleteStyles, type CompletionItem } from "./shared";
 import "./AutocompleteMenu";
 
+/** Session/workspace identity used by prompt completions. */
+export interface PromptCompletionContext {
+  sessionId?: string | undefined;
+  cwd?: string | undefined;
+  machineId: string;
+  projectId?: string | undefined;
+  workspaceId?: string | undefined;
+  workspaceScopedFileSuggestions: boolean;
+}
+
+export const emptyPromptCompletionContext = (): PromptCompletionContext => ({
+  machineId: "local",
+  workspaceScopedFileSuggestions: false,
+});
+
 /**
  * The editing surface shared by the prompt composer and the inline message
  * rewrite: a CodeMirror document with `@`/`/` completions and the app's Enter
@@ -31,12 +46,7 @@ export class PromptTextarea extends LitElement {
   @property() placeholder = "";
   @property({ type: Boolean }) disabled = false;
   /** Completion context. Commands need a session and cwd; file suggestions need a cwd. */
-  @property() sessionId?: string;
-  @property() cwd?: string;
-  @property() machineId = "local";
-  @property() projectId?: string;
-  @property() workspaceId?: string;
-  @property({ type: Boolean }) workspaceScopedFileSuggestions = false;
+  @property({ attribute: false }) completionContext: PromptCompletionContext = emptyPromptCompletionContext();
   /** Reports the current text on every change. The host decides what to persist or derive from it. */
   @property({ attribute: false }) onInput?: (text: string) => void;
   /** Enter resolved to "send". `shiftKey` is the effective (preference-and-platform-adjusted) shift. */
@@ -196,8 +206,9 @@ export class PromptTextarea extends LitElement {
       this.completions = [];
       return;
     }
-    if (trigger.kind === "command" && this.sessionId !== undefined && this.sessionId !== "" && this.cwd !== undefined && this.cwd !== "") {
-      const commands = await api.commands({ id: this.sessionId, cwd: this.cwd }, this.machineId).catch(emptySlashCommands);
+    const context = this.completionContext;
+    if (trigger.kind === "command" && context.sessionId !== undefined && context.sessionId !== "" && context.cwd !== undefined && context.cwd !== "") {
+      const commands = await api.commands({ id: context.sessionId, cwd: context.cwd }, context.machineId).catch(emptySlashCommands);
       if (version !== this.requestVersion) return;
       this.completions = commands
         .filter((command) => command.name.toLowerCase().includes(trigger.query.toLowerCase()))
@@ -210,8 +221,8 @@ export class PromptTextarea extends LitElement {
           detail: command.source,
           ...(command.description === undefined ? {} : { description: command.description }),
         }));
-    } else if (trigger.kind === "file" && this.cwd !== undefined && this.cwd !== "") {
-      const files = await api.files(this.cwd, trigger.query, { scope: trigger.fileScope, machineId: this.machineId, projectId: this.projectId, workspaceId: this.workspaceId, workspaceScoped: this.workspaceScopedFileSuggestions }).catch(emptyFileSuggestions);
+    } else if (trigger.kind === "file" && context.cwd !== undefined && context.cwd !== "") {
+      const files = await api.files(context.cwd, trigger.query, { scope: trigger.fileScope, machineId: context.machineId, projectId: context.projectId, workspaceId: context.workspaceId, workspaceScoped: context.workspaceScopedFileSuggestions }).catch(emptyFileSuggestions);
       if (version !== this.requestVersion) return;
       this.completions = files
         .slice(0, 12)

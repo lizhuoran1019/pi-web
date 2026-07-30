@@ -1,6 +1,6 @@
 import { css, html, LitElement } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
-import type { PromptTextarea } from "./PromptTextarea";
+import { emptyPromptCompletionContext, type PromptCompletionContext, type PromptTextarea } from "./PromptTextarea";
 import "./PromptTextarea";
 
 /**
@@ -23,12 +23,7 @@ export class MessageRewriteEditor extends LitElement {
   /** Whether the message also holds parts a rewrite cannot carry, such as pasted images. */
   @property({ type: Boolean }) hasUncarriedParts = false;
   /** Completion context, forwarded to the shared editor so `@`/`/` resolve against this session. */
-  @property() sessionId?: string;
-  @property() cwd?: string;
-  @property() machineId = "local";
-  @property() projectId?: string;
-  @property() workspaceId?: string;
-  @property({ type: Boolean }) workspaceScopedFileSuggestions = false;
+  @property({ attribute: false }) completionContext: PromptCompletionContext = emptyPromptCompletionContext();
   /** Fork the conversation at this message and send `text` as the new branch's opening prompt. Rejection is shown inline. */
   @property({ attribute: false }) onSubmit?: (text: string) => Promise<void>;
   /** Abandon the rewrite. The message's read-only body returns unchanged. */
@@ -45,12 +40,7 @@ export class MessageRewriteEditor extends LitElement {
         placeholder="Rewrite this message…"
         .value=${this.text}
         ?disabled=${this.submitting}
-        .sessionId=${this.sessionId}
-        .cwd=${this.cwd}
-        .machineId=${this.machineId}
-        .projectId=${this.projectId}
-        .workspaceId=${this.workspaceId}
-        .workspaceScopedFileSuggestions=${this.workspaceScopedFileSuggestions}
+        .completionContext=${this.completionContext}
         .onInput=${(value: string) => { this.draft = value; }}
         .onSubmit=${() => { void this.submit(); }}
         .onEscape=${() => { this.cancel(); }}

@@ -10,7 +10,7 @@ import { loadAttachmentDelivery, saveAttachmentDelivery } from "../attachmentPre
 import { promptEditorStyles } from "./shared";
 import { renderAttachIcon, renderSendIcon, renderQueueIcon, renderSteerIcon, renderStopIcon, renderThinkingGauge } from "./promptEditorIcons";
 import { thinkingGauge, thinkingLevelLabel } from "../../../shared/thinkingLevels";
-import type { PromptTextarea } from "./PromptTextarea";
+import type { PromptCompletionContext, PromptTextarea } from "./PromptTextarea";
 import "./PromptTextarea";
 
 type PendingAttachment = CapturedAttachment & { id: string };
@@ -76,6 +76,14 @@ export class PromptEditor extends LitElement {
     const shellMode = shellInputMode !== undefined;
     const queuesInput = this.canSteer || this.isCompacting;
     const busy = this.disabled || this.sending;
+    const completionContext: PromptCompletionContext = {
+      sessionId: this.sessionId,
+      cwd: this.cwd,
+      machineId: this.machineId,
+      projectId: this.projectId,
+      workspaceId: this.workspaceId,
+      workspaceScopedFileSuggestions: this.workspaceScopedFileSuggestions,
+    };
     return html`
       <footer class=${shellMode ? "shell-mode" : ""} @paste=${(event: ClipboardEvent) => { void this.handlePaste(event); }} @dragover=${(event: DragEvent) => { this.handleDragOver(event); }} @drop=${(event: DragEvent) => { void this.handleDrop(event); }}>
         <div class=${`editor-wrap${shellMode ? " shell-mode" : ""}`}>
@@ -83,12 +91,7 @@ export class PromptEditor extends LitElement {
             placeholder=${PROMPT_PLACEHOLDER}
             .value=${this.draft}
             ?disabled=${this.disabled}
-            .sessionId=${this.sessionId}
-            .cwd=${this.cwd}
-            .machineId=${this.machineId}
-            .projectId=${this.projectId}
-            .workspaceId=${this.workspaceId}
-            .workspaceScopedFileSuggestions=${this.workspaceScopedFileSuggestions}
+            .completionContext=${completionContext}
             .onInput=${(value: string) => { this.updateDraft(value); }}
             .onSubmit=${() => { this.send(this.canSteer || this.isCompacting ? "followUp" : undefined); }}
           ></prompt-textarea>

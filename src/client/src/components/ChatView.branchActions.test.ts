@@ -101,6 +101,12 @@ describe("ChatView edit-from-here wiring", () => {
     expect(requiredButton(view, "Show newer branch").disabled).toBe(true);
   });
 
+  it("omits the action while the session has work in flight", async () => {
+    const view = await renderView({ onRewriteMessage: vi.fn(() => Promise.resolve()), isSendingPrompt: true });
+
+    expect(findButton(view, editLabel)).toBeUndefined();
+  });
+
   it("omits the action entirely when no rewrite handler is wired", async () => {
     const view = await renderView();
 
@@ -144,12 +150,14 @@ async function renderView(options: {
   messages?: ChatLine[];
   onShowBranch?: (targetId: string) => Promise<void>;
   sessionTree?: SessionTreeSnapshot;
+  isSendingPrompt?: boolean;
 } = {}): Promise<ChatView> {
   const view = new ChatView();
   view.sessionId = "session-1";
   view.messages = options.messages ?? [shownAsk];
   view.messageEnd = view.messages.length;
   view.messageTotal = view.messages.length;
+  view.isSendingPrompt = options.isSendingPrompt ?? false;
   if (options.onRewriteMessage !== undefined) view.onRewriteMessage = options.onRewriteMessage;
   if (options.onShowBranch !== undefined) view.onShowBranch = options.onShowBranch;
   if (options.sessionTree !== undefined) view.sessionTree = options.sessionTree;

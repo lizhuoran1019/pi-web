@@ -28,6 +28,7 @@ import {
 } from "../sessionNotifications";
 import type { ChatLine, ChatPart } from "./shared";
 import { chatStyles, renderSessionWarningIcon } from "./shared";
+import { emptyPromptCompletionContext, type PromptCompletionContext } from "./PromptTextarea";
 import "./AskUserCard";
 import "./MessageRewriteEditor";
 import "./ExtensionDialogCard";
@@ -143,8 +144,6 @@ export function chatQueuedSectionShowsClearAction(section: QueuedMessageSection,
 export interface ChatEditFromHereAction {
   /** Session entry the rewrite will replace. */
   entryId: string;
-  /** Why the action is currently refused, or `undefined` when it can run. */
-  disabledReason: string | undefined;
 }
 
 /**
@@ -160,8 +159,8 @@ export interface ChatEditFromHereAction {
  * up a rewrite that has nowhere to land when they press send.
  */
 export function chatEditFromHereAction(message: ChatLine, sessionLive: boolean): ChatEditFromHereAction | undefined {
-  if (message.role !== "user" || message.entryId === undefined) return undefined;
-  return { entryId: message.entryId, disabledReason: sessionLive ? "stop current activity first" : undefined };
+  if (sessionLive || message.role !== "user" || message.entryId === undefined) return undefined;
+  return { entryId: message.entryId };
 }
 
 /** One arrow of the branch switcher. A missing target renders it disabled. */
@@ -256,11 +255,7 @@ export class ChatView extends LitElement {
   @property({ attribute: false }) messages: ChatLine[] = [];
   @property() sessionId = "";
   /** Completion context forwarded to the inline rewrite editor so `@`/`/` resolve against this session. */
-  @property() cwd?: string;
-  @property() machineId = "local";
-  @property() projectId?: string;
-  @property() workspaceId?: string;
-  @property({ type: Boolean }) workspaceScopedFileSuggestions = false;
+  @property({ attribute: false }) completionContext: PromptCompletionContext = emptyPromptCompletionContext();
   @property({ type: Number }) messageStart = 0;
   @property({ type: Number }) messageEnd = 0;
   @property({ type: Number }) messageTotal = 0;
@@ -980,7 +975,8 @@ export class ChatView extends LitElement {
 
   private renderMessageActions(message: ChatLine, key: string) {
     const copyable = this.isCopyableMessage(message);
-    const editFromHere = this.onRewriteMessage === undefined ? undefined : chatEditFromHereAction(message, this.isSessionLive());
+    const rewriting = this.rewritingEntryId === message.entryId;
+    const editFromHere = this.onRewriteMessage === undefined ? undefined : chatEditFromHereAction(message, this.isSessionLive() && !rewriting);
     if (!copyable && editFromHere === undefined) return null;
     const copied = this.copiedMessageKey === key;
     return html`
@@ -1009,7 +1005,7 @@ export class ChatView extends LitElement {
       ? "finish or cancel the current rewrite"
       : this.isNavigatingTree()
         ? "already navigating"
-        : action.disabledReason;
+        : undefined;
     return html`
       <button
         type="button"
@@ -1074,12 +1070,7 @@ export class ChatView extends LitElement {
       <message-rewrite-editor
         .text=${this.messageCopyText(message)}
         .hasUncarriedParts=${message.parts.some((part) => part.type !== "text")}
-        .sessionId=${this.sessionId}
-        .cwd=${this.cwd}
-        .machineId=${this.machineId}
-        .projectId=${this.projectId}
-        .workspaceId=${this.workspaceId}
-        .workspaceScopedFileSuggestions=${this.workspaceScopedFileSuggestions}
+        .completionContext=${this.completionContext}
         .onSubmit=${(text: string) => this.submitRewrite(message.entryId ?? "", text)}
         .onCancel=${() => { this.cancelRewrite(index); }}
       ></message-rewrite-editor>
